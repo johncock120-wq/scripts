@@ -1,0 +1,1243 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+
+local localPlayer = Players.LocalPlayer
+local DC_PLACE = 18240434416
+local inGame = game.PlaceId == DC_PLACE
+
+if type(_G.DeathCrushCleanup) == "function" then pcall(_G.DeathCrushCleanup) end
+
+local THEME = {
+	bg = Color3.fromRGB(7, 3, 5),
+	panel = Color3.fromRGB(19, 7, 10),
+	panelHover = Color3.fromRGB(46, 9, 15),
+	accent = Color3.fromRGB(228, 16, 38),
+	ember = Color3.fromRGB(255, 108, 36),
+	text = Color3.fromRGB(240, 228, 220),
+	subtext = Color3.fromRGB(140, 90, 94),
+	red = Color3.fromRGB(110, 0, 10),
+	stroke = Color3.fromRGB(64, 18, 25),
+	good = Color3.fromRGB(80, 200, 110),
+	warn = Color3.fromRGB(255, 150, 40),
+}
+local COLORS = {
+	killer = Color3.fromRGB(230, 30, 45),
+	victim = Color3.fromRGB(70, 200, 110),
+	generator = Color3.fromRGB(255, 210, 60),
+	gate = Color3.fromRGB(90, 170, 255),
+}
+
+local state = {
+	killerEsp = true, victimEsp = false, genEsp = false, gateEsp = false, dangerMeter = true,
+	autoSkill = false, infStamina = false, killAura = false, autoSouls = false, fastVault = false, noSlow = false, autoChest = false,
+}
+local Settings = {file = "DeathCrushSettings.json", data = {}, extra = {}}
+do
+	local HttpService = game:GetService("HttpService")
+	local okRead, raw = pcall(function()
+		return typeof(isfile) == "function" and isfile(Settings.file) and readfile(Settings.file) or nil
+	end)
+	if okRead and type(raw) == "string" and raw ~= "" then
+		local okJson, t = pcall(HttpService.JSONDecode, HttpService, raw)
+		if okJson and type(t) == "table" then Settings.data = t end
+	end
+	local queued = false
+	function Settings.save()
+		if queued or typeof(writefile) ~= "function" then return end
+		queued = true
+		task.delay(0.5, function()
+			queued = false
+			local out = {toggles = {}, extra = {}}
+			for k, v in pairs(state) do if type(v) == "boolean" then out.toggles[k] = v end end
+			for k, get in pairs(Settings.extra) do
+				local okGet, v = pcall(get)
+				if okGet then out.extra[k] = v end
+			end
+			pcall(function() writefile(Settings.file, HttpService:JSONEncode(out)) end)
+		end)
+	end
+	function Settings.value(name, get)
+		Settings.extra[name] = get
+		local e = Settings.data.extra
+		return type(e) == "table" and e[name] or nil
+	end
+	local saved = Settings.data.toggles
+	if type(saved) == "table" then
+		for k, v in pairs(saved) do
+			if state[k] ~= nil and type(v) == "boolean" then state[k] = v end
+		end
+	end
+	state.killAura = false
+end
+local toggleSetters = {}
+local AURA_RANGE = 8
+AURA_RANGE = tonumber(Settings.value("auraRange", function() return AURA_RANGE end)) or AURA_RANGE
+
+local connections, cleanupTasks = {}, {}
+local function track(c) table.insert(connections, c); return c end
+local function onCleanup(fn) table.insert(cleanupTasks, fn) end
+
+local FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local SPRING = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local function tween(obj, props, info) TweenService:Create(obj, info or FAST, props):Play() end
+
+local function make(class, props, children)
+	local obj = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		if k ~= "Parent" then obj[k] = v end
+	end
+	for _, child in ipairs(children or {}) do child.Parent = obj end
+	if props and props.Parent then obj.Parent = props.Parent end
+	return obj
+end
+local function corner(r) return make("UICorner", {CornerRadius = UDim.new(0, r or 8)}) end
+local function stroke(color, thick, transp)
+	return make("UIStroke", {Color = color, Thickness = thick or 1, Transparency = transp or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border})
+end
+
+local UI = {scale = 1.3, title = "DeathCrush"}
+UI.guiParent = (typeof(gethui) == "function" and gethui()) or localPlayer:WaitForChild("PlayerGui")
+do
+	local function face(name, weight)
+		local ok, f = pcall(function() return Font.new(Font.fromEnum(Enum.Font[name]).Family, weight or Enum.FontWeight.Regular) end)
+		return ok and f or nil
+	end
+	local FONT_MAP = {
+		[Enum.Font.GothamBlack] = {face("Creepster"), 3},
+		[Enum.Font.GothamBold] = {face("Oswald", Enum.FontWeight.Bold), 1},
+		[Enum.Font.GothamMedium] = {face("Oswald", Enum.FontWeight.Medium), 1},
+	}
+	local okG, gothic = pcall(function() return Enum.Font.GrenzeGotisch end)
+	UI.gothicFont = okG and gothic or Enum.Font.GothamBold
+	local SHARP = UDim.new(0, 2)
+	function UI.skinText(o)
+		if not (o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox")) then return end
+		local m = FONT_MAP[o.Font]
+		if m and m[1] then
+			o.FontFace = m[1]
+			o.TextSize += m[2]
+		end
+	end
+	local function skinCorner(c)
+		local p = c.Parent
+		if not (p and p:IsA("GuiObject")) or c.CornerRadius.Scale ~= 0 then return end
+		local s = p.Size
+		local w = s.X.Scale == 0 and s.X.Offset or math.huge
+		local h = s.Y.Scale == 0 and s.Y.Offset or math.huge
+		local small = math.min(w, h)
+		if small > 0 and c.CornerRadius.Offset * 2 >= small - 1 then return end
+		c.CornerRadius = SHARP
+	end
+	local function skinOne(d) if d:IsA("UICorner") then skinCorner(d) else UI.skinText(d) end end
+	function UI.skinTree(root)
+		for _, d in ipairs(root:GetDescendants()) do pcall(skinOne, d) end
+		track(root.DescendantAdded:Connect(function(d) task.defer(pcall, skinOne, d) end))
+	end
+
+	local folder = make("Folder", {Name = UI.title .. "SFX", Parent = game:GetService("SoundService")})
+	onCleanup(function() folder:Destroy() end)
+	local SFX = {
+		click = {"rbxasset://sounds/clickfast.wav", 0.35, 1.1},
+		on = {"rbxasset://sounds/electronicpingshort.wav", 0.3, 1.25},
+		off = {"rbxasset://sounds/electronicpingshort.wav", 0.25, 0.8},
+		error = {"rbxasset://sounds/electronicpingshort.wav", 0.4, 0.55},
+		slide = {"rbxasset://sounds/clickfast.wav", 0.3, 0.7},
+	}
+	local sounds = {}
+	for name, def in pairs(SFX) do
+		sounds[name] = make("Sound", {Name = name, SoundId = def[1], Volume = def[2], PlaybackSpeed = def[3], Parent = folder})
+	end
+	function UI.sfx(name)
+		local s = sounds[name]
+		if s and s.Parent then s.TimePosition = 0; s:Play() end
+	end
+
+	local ICONS = {
+		settings = {16898613777, {48, 48}, {771, 257}},
+		skull = {16898613777, {48, 48}, {49, 869}},
+		user = {16898613869, {48, 48}, {661, 869}},
+		globe = {16898613509, {48, 48}, {771, 563}},
+		wrench = {16898613869, {48, 48}, {820, 906}},
+		["chevron-right"] = {16898612819, {48, 48}, {869, 759}},
+		eye = {136111683851629, {24, 24}, {175, 675}},
+		["eye-off"] = {136111683851629, {24, 24}, {200, 650}},
+		lock = {136111683851629, {24, 24}, {300, 800}},
+		gamepad = {136111683851629, {24, 24}, {350, 600}},
+	}
+	function UI.icon(name, size, parent, color, extra)
+		local e = ICONS[name]
+		if not e then return nil end
+		local props = {
+			BackgroundTransparency = 1, Image = "rbxassetid://" .. e[1],
+			ImageRectSize = Vector2.new(e[2][1], e[2][2]), ImageRectOffset = Vector2.new(e[3][1], e[3][2]),
+			Size = UDim2.fromOffset(size, size), ImageColor3 = color or Color3.new(1, 1, 1), Parent = parent,
+		}
+		for k, v in pairs(extra or {}) do props[k] = v end
+		return make("ImageLabel", props)
+	end
+
+	function UI.hover(btn, normal, hover)
+		track(btn.MouseEnter:Connect(function() tween(btn, {BackgroundColor3 = hover}) end))
+		track(btn.MouseLeave:Connect(function() tween(btn, {BackgroundColor3 = normal}) end))
+	end
+	function UI.press(b)
+		local scale = make("UIScale", {Parent = b})
+		local PRESS = TweenInfo.new(0.12, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		track(b.MouseButton1Down:Connect(function() UI.sfx("click"); tween(scale, {Scale = 0.95}, PRESS) end))
+		track(b.MouseButton1Up:Connect(function() tween(scale, {Scale = 1}, SPRING) end))
+		track(b.MouseLeave:Connect(function() tween(scale, {Scale = 1}, SPRING) end))
+	end
+
+	UI.toastGui = make("ScreenGui", {Name = UI.title .. "Toasts", ResetOnSpawn = false, DisplayOrder = 2147483647,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = UI.guiParent})
+	onCleanup(function() UI.toastGui:Destroy() end)
+	UI.toastHolder = make("Frame", {BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -16, 0, 56), Size = UDim2.new(0, 290, 1, -72), Parent = UI.toastGui,
+	}, {make("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder})})
+	UI.skinTree(UI.toastGui)
+	UI.toastCount = 0
+end
+
+local function notify(title, text, color)
+	if not UI.toastHolder.Parent then return end
+	if color == THEME.red then UI.sfx("error") end
+	UI.toastCount += 1
+	local holder = make("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 46), LayoutOrder = UI.toastCount,
+		Parent = UI.toastHolder})
+	local card = make("Frame", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Position = UDim2.new(1, 30, 0, 0),
+		Size = UDim2.fromScale(1, 1), Parent = holder}, {corner(8), stroke(THEME.panelHover, 1, 0)})
+	make("Frame", {BackgroundColor3 = color or THEME.accent, BorderSizePixel = 0, Position = UDim2.new(0, 6, 0, 8),
+		Size = UDim2.new(0, 3, 1, -16), Parent = card}, {corner(2)})
+	make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 16, 0, 5), Size = UDim2.new(1, -24, 0, 14),
+		Font = Enum.Font.GothamBold, Text = tostring(title):upper(), TextSize = 10, TextColor3 = color or THEME.accent,
+		TextXAlignment = Enum.TextXAlignment.Left, Parent = card})
+	make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 16, 0, 20), Size = UDim2.new(1, -24, 0, 20),
+		Font = Enum.Font.GothamMedium, Text = tostring(text or ""), TextSize = 12, TextColor3 = THEME.text,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
+	tween(card, {Position = UDim2.new(0, 0, 0, 0)}, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out))
+	local items = {}
+	for _, c in ipairs(UI.toastHolder:GetChildren()) do if c:IsA("Frame") then table.insert(items, c) end end
+	table.sort(items, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+	for i = 1, #items - 5 do items[i]:Destroy() end
+	task.delay(3.5, function()
+		if not card.Parent then return end
+		tween(card, {Position = UDim2.new(1, 30, 0, 0)}, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.In))
+		task.wait(0.25)
+		holder:Destroy()
+	end)
+end
+
+local gui = make("ScreenGui", {Name = UI.title .. "UI", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 2147483640, Parent = UI.guiParent})
+make("UIScale", {Scale = UI.scale, Parent = gui})
+UI.skinTree(gui)
+local espFolder = make("ScreenGui", {Name = UI.title .. "ESP", ResetOnSpawn = false, IgnoreGuiInset = true,
+	DisplayOrder = 2147483639, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = UI.guiParent})
+onCleanup(function() espFolder:Destroy() end)
+
+local frame, titleBar, closeBtn
+do
+	local W, H, TITLE_H, SIDEBAR_W = 520, 380, 40, 124
+	local function rand(a, b) return a + math.random() * (b - a) end
+	frame = make("Frame", {
+		BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Size = UDim2.fromOffset(W, H),
+		Position = UDim2.new(0.5, -W / 2 + 40, 0.5, -H / 2 + 20), ClipsDescendants = true, Active = true, Parent = gui,
+	}, {corner(12), stroke(Color3.new(1, 1, 1), 2, 0.15)})
+	make("UIGradient", {Parent = frame:FindFirstChildOfClass("UIStroke"), Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, THEME.accent), ColorSequenceKeypoint.new(0.5, Color3.fromRGB(60, 0, 0)),
+		ColorSequenceKeypoint.new(1, THEME.accent)})})
+	make("UIGradient", {Rotation = 90, Parent = frame,
+		Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(150, 120, 120))})
+	make("Frame", {Name = "Hellglow", BackgroundColor3 = THEME.accent, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+		Parent = frame}, {make("UIGradient", {Rotation = 90, Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.55, 1), NumberSequenceKeypoint.new(1, 0.78)})})})
+	local embers = make("Frame", {Name = "Embers", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = frame})
+	task.spawn(function()
+		while frame.Parent do
+			if frame.Visible and #embers:GetChildren() < 24 then
+				local x, s, life = math.random(), math.random(2, 4), rand(2.5, 4.5)
+				local e = make("Frame", {BackgroundColor3 = math.random() < 0.55 and THEME.ember or THEME.accent,
+					BackgroundTransparency = 0.15, BorderSizePixel = 0, Rotation = 45, Position = UDim2.new(x, 0, 1, 4),
+					Size = UDim2.fromOffset(s, s), Parent = embers})
+				tween(e, {Position = UDim2.new(x + rand(-0.06, 0.06), 0, rand(0.35, 0.75), 0), BackgroundTransparency = 1,
+					Rotation = 45 + rand(-200, 200)}, TweenInfo.new(life, Enum.EasingStyle.Sine, Enum.EasingDirection.Out))
+				task.delay(life, function() e:Destroy() end)
+			end
+			task.wait(0.28)
+		end
+	end)
+	local shadow = make("ImageLabel", {BackgroundTransparency = 1, Image = "rbxassetid://6014261993",
+		ImageColor3 = Color3.fromRGB(140, 0, 14), ImageTransparency = 0.4, ScaleType = Enum.ScaleType.Slice,
+		SliceCenter = Rect.new(49, 49, 450, 450), ZIndex = 0, Parent = gui})
+	local function syncShadow()
+		shadow.Position = frame.Position - UDim2.fromOffset(24, 24)
+		shadow.Size = frame.Size + UDim2.fromOffset(48, 48)
+		shadow.Visible = frame.Visible
+	end
+	syncShadow()
+	track(frame:GetPropertyChangedSignal("Position"):Connect(syncShadow))
+	track(frame:GetPropertyChangedSignal("Size"):Connect(syncShadow))
+
+	titleBar = make("Frame", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, TITLE_H),
+		Active = true, Parent = frame}, {corner(12)})
+	make("Frame", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, Position = UDim2.new(0, 0, 1, -12),
+		Size = UDim2.new(1, 0, 0, 12), Parent = titleBar})
+	make("Frame", {BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Position = UDim2.new(0, 0, 1, -2),
+		Size = UDim2.new(1, 0, 0, 2), Parent = titleBar,
+	}, {make("UIGradient", {Color = ColorSequence.new(THEME.accent, Color3.fromRGB(60, 0, 0))})})
+	local fangs = make("Frame", {BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0, TITLE_H),
+		Size = UDim2.new(1, 0, 0, 0), Parent = frame})
+	local fangCount = math.max(6, math.floor(W / 12))
+	for i = 0, fangCount do
+		local s = 4 + (i * 7 + 3) % 6
+		make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Rotation = 45,
+			Position = UDim2.new(i / fangCount, 0, 0, -1), Size = UDim2.fromOffset(s, s), Parent = fangs})
+		if i % 5 == 2 then
+			local len = 4 + (i * 11) % 8
+			local drip = make("Frame", {BackgroundColor3 = Color3.fromRGB(170, 6, 24), BorderSizePixel = 0,
+				AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(i / fangCount, 0, 0, 0), Size = UDim2.fromOffset(2, len),
+				Parent = fangs}, {corner(1)})
+			TweenService:Create(drip, TweenInfo.new(rand(1.8, 3.2), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+				{Size = UDim2.fromOffset(2, len + rand(3, 6))}):Play()
+		end
+	end
+	for _, a in ipairs({Vector2.new(0, 0), Vector2.new(1, 0), Vector2.new(0, 1), Vector2.new(1, 1)}) do
+		make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Rotation = 45,
+			Position = UDim2.fromScale(a.X, a.Y), Size = UDim2.fromOffset(16, 16), ZIndex = 20, Parent = frame})
+	end
+	local logo = make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(24, 24), Parent = titleBar,
+	}, {corner(7), make("UIGradient", {Rotation = 45,
+		Color = ColorSequence.new(Color3.fromRGB(255, 90, 100), Color3.fromRGB(120, 0, 15))})})
+	UI.icon("skull", 16, logo, Color3.new(1, 1, 1), {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+	local ring = make("Frame", {BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 22, 0.5, 0), Size = UDim2.fromOffset(32, 32), Parent = titleBar}, {corner(16)})
+	local ringStroke = stroke(THEME.accent, 1.5, 0)
+	ringStroke.Parent = ring
+	make("UIGradient", {Parent = ringStroke, Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.5, 1), NumberSequenceKeypoint.new(1, 0)})})
+	TweenService:Create(ring, TweenInfo.new(2.5, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1), {Rotation = 360}):Play()
+	local titleLabel = make("TextLabel", {BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.X,
+		Position = UDim2.new(0, 42, 0, 0), Size = UDim2.new(0, 0, 1, 0), Font = Enum.Font.GothamBlack,
+		Text = "DEATHCRUSH", TextSize = 15, TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = titleBar})
+	UI.crumb = make("TextLabel", {BackgroundTransparency = 1, Size = UDim2.new(0, 200, 1, 0), Font = Enum.Font.GothamMedium,
+		Text = "", TextSize = 12, TextColor3 = THEME.subtext, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, RichText = true, Parent = titleBar})
+	local function placeCrumb()
+		UI.crumb.Position = UDim2.new(0, 42 + titleLabel.AbsoluteSize.X / UI.scale + 10, 0, 0)
+	end
+	track(titleLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(placeCrumb))
+	task.defer(placeCrumb)
+
+	local function titleButton(text, xOffset, hoverColor)
+		local b = make("TextButton", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, xOffset, 0.5, 0), Size = UDim2.fromOffset(24, 24),
+			Font = Enum.Font.GothamBold, Text = text, TextSize = 14, TextColor3 = THEME.text, Parent = titleBar}, {corner(6)})
+		UI.hover(b, THEME.panel, hoverColor)
+		return b
+	end
+	closeBtn = titleButton("×", -6, THEME.red)
+	local minBtn = titleButton("–", -34, THEME.panelHover)
+	do
+		local MOVE = TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.InOut)
+		local OPEN = TweenInfo.new(0.45, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+		local minimized, restorePos, tabHolder, tabBtn = false, nil, nil, nil
+		local function dockStack()
+			local sg = UI.guiParent:FindFirstChild("GameScriptDock")
+			if not sg then
+				sg = make("ScreenGui", {Name = "GameScriptDock", ResetOnSpawn = false, DisplayOrder = 2147483641,
+					ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = UI.guiParent})
+				make("UIScale", {Scale = UI.scale, Parent = sg})
+				make("Frame", {Name = "Stack", BackgroundTransparency = 1, AnchorPoint = Vector2.new(0, 1),
+					Position = UDim2.new(0, 0, 1, -40), Size = UDim2.new(0, 40, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+					Parent = sg}, {make("UIListLayout", {Padding = UDim.new(0, 16),
+					VerticalAlignment = Enum.VerticalAlignment.Bottom, SortOrder = Enum.SortOrder.LayoutOrder})})
+			end
+			return sg:FindFirstChild("Stack")
+		end
+		local function offLeft()
+			return UDim2.new(0, -(W + 80), restorePos.Y.Scale, restorePos.Y.Offset)
+		end
+		local function spikeTab(btn, heightPx)
+			make("Frame", {Name = "Hellglow", BackgroundColor3 = THEME.accent, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+				ZIndex = btn.ZIndex, Parent = btn}, {corner(2), make("UIGradient", {Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.45, 0.94), NumberSequenceKeypoint.new(1, 0.68)})})})
+			local count = math.max(3, math.floor(heightPx / 13))
+			for i = 0, count - 1 do
+				local s = 5 + (i * 5 + 2) % 4
+				make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Rotation = 45,
+					Position = UDim2.new(1, 0, (i + 0.5) / count, 0), Size = UDim2.fromOffset(s, s), ZIndex = btn.ZIndex, Parent = btn})
+			end
+			for _, y in ipairs({0, 1}) do
+				make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Rotation = 45,
+					Position = UDim2.fromScale(1, y), Size = UDim2.fromOffset(9, 9), ZIndex = btn.ZIndex, Parent = btn})
+			end
+			local s = btn:FindFirstChildOfClass("UIStroke")
+			if s then
+				TweenService:Create(s, TweenInfo.new(1.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+					{Transparency = 0.75}):Play()
+			end
+		end
+
+		local function restore()
+			if not minimized then return end
+			minimized = false
+			if tabHolder then
+				local holder, b = tabHolder, tabBtn
+				tabHolder, tabBtn = nil, nil
+				tween(b, {Position = UDim2.new(0, -40, 0, 0)}, TweenInfo.new(0.2))
+				task.delay(0.2, function() holder:Destroy() end)
+			end
+			frame.Position = offLeft()
+			frame.Visible = true
+			tween(frame, {Position = restorePos}, MOVE)
+			local s = frame:FindFirstChild("PopScale") or make("UIScale", {Name = "PopScale", Scale = 0.6, Parent = frame})
+			tween(s, {Scale = 1}, OPEN)
+			task.delay(0.5, function() if s.Parent and not minimized then s:Destroy() end end)
+			shadow.ImageTransparency = 1
+			task.delay(0.35, function() if not minimized then tween(shadow, {ImageTransparency = 0.4}, OPEN) end end)
+			UI.sfx("slide")
+		end
+
+		local function minimize()
+			if minimized then return end
+			minimized = true
+			restorePos = frame.Position
+			tween(frame, {Position = offLeft()}, MOVE)
+			local old = frame:FindFirstChild("PopScale")
+			if old then old:Destroy() end
+			tween(make("UIScale", {Name = "PopScale", Parent = frame}), {Scale = 0.6}, MOVE)
+			tween(shadow, {ImageTransparency = 1}, MOVE)
+			UI.sfx("slide")
+			task.delay(0.3, function() if minimized then frame.Visible = false end end)
+
+			local name = titleLabel.Text
+			local h = math.clamp(26 + #name * 8, 80, 180)
+			tabHolder = make("Frame", {BackgroundTransparency = 1, Size = UDim2.new(0, 40, 0, h), Parent = dockStack()})
+			tabBtn = make("TextButton", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, AutoButtonColor = false,
+				Position = UDim2.new(0, -40, 0, 0), Size = UDim2.new(0, 30, 1, 0), Text = "", ZIndex = 50, Parent = tabHolder,
+			}, {corner(2), stroke(THEME.accent, 1, 0.3)})
+			spikeTab(tabBtn, h)
+			local label = make("TextLabel", {BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new(0.5, 4, 0.5, 0), Size = UDim2.new(0, h - 14, 0, 18), Rotation = -90,
+				Font = Enum.Font.GothamBold, Text = name, TextSize = 12, TextColor3 = THEME.accent,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 51, Parent = tabBtn})
+			UI.skinText(label)
+			local b = tabBtn
+			tween(b, {Position = UDim2.new(0, -8, 0, 0)}, TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.Out))
+			b.MouseEnter:Connect(function() tween(b, {BackgroundColor3 = THEME.panelHover, Position = UDim2.new(0, -4, 0, 0)}) end)
+			b.MouseLeave:Connect(function() tween(b, {BackgroundColor3 = THEME.bg, Position = UDim2.new(0, -8, 0, 0)}) end)
+			b.Activated:Connect(restore)
+		end
+
+		track(minBtn.Activated:Connect(function() UI.sfx("click"); minimize() end))
+		onCleanup(function() if tabHolder then tabHolder:Destroy() end end)
+	end
+
+	local body = make("Frame", {BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0, TITLE_H),
+		Size = UDim2.new(1, 0, 1, -TITLE_H), Parent = frame}, {make("UIPadding", {
+		PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 10)})})
+	local sidebar = make("Frame", {BackgroundTransparency = 1, Size = UDim2.new(0, SIDEBAR_W, 1, 0), Parent = body})
+	UI.tabList = make("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -50), Parent = sidebar},
+		{make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder})})
+	local card = make("Frame", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 44), Parent = sidebar}, {corner(8), stroke(THEME.stroke, 1, 0)})
+	local avatar = make("ImageLabel", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 7, 0.5, 0), Size = UDim2.fromOffset(30, 30), Parent = card}, {corner(15), stroke(THEME.accent, 1, 0.3)})
+	make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 44, 0, 7), Size = UDim2.new(1, -50, 0, 15),
+		Font = Enum.Font.GothamBold, Text = localPlayer.DisplayName, TextSize = 12, TextColor3 = THEME.text,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
+	make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 44, 0, 22), Size = UDim2.new(1, -50, 0, 13),
+		Font = Enum.Font.Gotham, Text = inGame and "game script" or "wrong game!", TextSize = 10,
+		TextColor3 = inGame and THEME.subtext or THEME.accent, TextXAlignment = Enum.TextXAlignment.Left, Parent = card})
+	task.spawn(function()
+		local ok, img = pcall(Players.GetUserThumbnailAsync, Players, localPlayer.UserId,
+			Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+		if ok and avatar.Parent then avatar.Image = img end
+	end)
+	UI.content = make("Frame", {BackgroundTransparency = 1, Position = UDim2.new(0, SIDEBAR_W + 10, 0, 0),
+		Size = UDim2.new(1, -(SIDEBAR_W + 10), 1, 0), Parent = body})
+
+	local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+	track(titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, frame.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end))
+	track(titleBar.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local d = (input.Position - dragStart) / UI.scale
+			tween(frame, {Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)},
+				TweenInfo.new(0.08))
+		end
+	end))
+
+	function UI.popIn()
+		local target = frame.Position
+		frame.Position = target + UDim2.fromOffset(0, 30)
+		tween(frame, {Position = target}, TweenInfo.new(0.45, Enum.EasingStyle.Quint, Enum.EasingDirection.Out))
+	end
+end
+
+UI.tabs = {}
+local function selectTab(name)
+	for _, t in ipairs(UI.tabs) do
+		local sel = t.name == name
+		if sel and not t.page.Visible then
+			t.page.Position = UDim2.new(0, 0, 0, 10)
+			tween(t.page, {Position = UDim2.new(0, 0, 0, 0)}, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out))
+		end
+		t.page.Visible = sel
+		tween(t.btn:FindFirstChildOfClass("UIStroke"), {Transparency = sel and 0.5 or 1})
+		tween(t.btn, {BackgroundColor3 = sel and THEME.panelHover or THEME.panel})
+		tween(t.bar, {Size = UDim2.new(0, 3, sel and 0.6 or 0, 0)})
+		t.label.TextColor3 = sel and THEME.text or THEME.subtext
+		if t.icon then t.icon.ImageColor3 = sel and THEME.accent or THEME.subtext end
+		if sel then UI.crumb.Text = "›  " .. name .. (inGame and "" or "   <font color=\"#E41026\">wrong game</font>") end
+	end
+end
+local function newTab(name, order, icon)
+	local page = make("ScrollingFrame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), Visible = false,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4,
+		ScrollBarImageColor3 = THEME.accent, Parent = UI.content,
+	}, {
+		make("UIPadding", {PaddingLeft = UDim.new(0, 3), PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3),
+			PaddingRight = UDim.new(0, 10)}),
+		make("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}),
+	})
+	local btn = make("TextButton", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false,
+		Size = UDim2.new(1, 0, 0, 34), Text = "", LayoutOrder = order, Parent = UI.tabList}, {corner(8), stroke(THEME.accent, 1, 1)})
+	local bar = make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(0, 3, 0, 0), Parent = btn}, {corner(2)})
+	local tabIcon = icon and UI.icon(icon, 16, btn, THEME.subtext, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0)})
+	local textX = tabIcon and 36 or 12
+	local label = make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, textX, 0, 0),
+		Size = UDim2.new(1, -(textX + 6), 1, 0), Font = Enum.Font.GothamBold, Text = name, TextSize = 13,
+		TextColor3 = THEME.subtext, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = btn})
+	local tab = {name = name, page = page, btn = btn, bar = bar, label = label, icon = tabIcon}
+	table.insert(UI.tabs, tab)
+	track(btn.Activated:Connect(function() UI.sfx("click"); selectTab(name) end))
+	track(btn.MouseEnter:Connect(function() if not page.Visible then tween(btn, {BackgroundColor3 = THEME.panelHover}) end end))
+	track(btn.MouseLeave:Connect(function() if not page.Visible then tween(btn, {BackgroundColor3 = THEME.panel}) end end))
+	return page
+end
+
+local function header(page, text)
+	return make("TextLabel", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), Font = UI.gothicFont, Text = text, TextSize = 15,
+		TextColor3 = Color3.fromRGB(176, 92, 98), TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+		LayoutOrder = #page:GetChildren(), Parent = page,
+	})
+end
+
+local function button(page, text, callback, parent)
+	local b = make("TextButton", {
+		BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false,
+		Size = parent and UDim2.new(0.5, -3, 0, 30) or UDim2.new(1, 0, 0, 30), Font = Enum.Font.GothamBold,
+		Text = text, TextSize = 12, TextColor3 = THEME.text, TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = parent and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left,
+		LayoutOrder = #page:GetChildren(), Parent = parent or page,
+	}, {corner(8), stroke(THEME.stroke, 1, 0),
+		make("UIPadding", {PaddingLeft = UDim.new(0, parent and 6 or 12), PaddingRight = UDim.new(0, parent and 6 or 28)})})
+	if not parent then
+		UI.icon("chevron-right", 16, b, THEME.subtext, {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 20, 0.5, 0)})
+	end
+	UI.hover(b, THEME.panel, THEME.panelHover)
+	UI.press(b)
+	track(b.Activated:Connect(function() task.spawn(callback) end))
+	return b
+end
+
+local function buttonGrid(page)
+	return make("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = #page:GetChildren(), Parent = page,
+	}, {make("UIGridLayout", {CellSize = UDim2.new(0.5, -3, 0, 30), CellPadding = UDim2.fromOffset(6, 6)})})
+end
+
+local function toggle(page, text, key, note, onChange)
+	local row = make("TextButton", {
+		BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+		Size = UDim2.new(1, 0, 0, note and 44 or 30), LayoutOrder = #page:GetChildren(), Parent = page,
+	}, {corner(8), stroke(THEME.stroke, 1, 0)})
+	make("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(12, note and 5 or 0),
+		Size = UDim2.new(1, -64, 0, note and 18 or 30), Font = Enum.Font.GothamMedium, Text = text, TextSize = 13,
+		TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
+	})
+	if note then
+		make("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 24), Size = UDim2.new(1, -64, 0, 14),
+			Font = Enum.Font.Gotham, Text = note, TextSize = 10, TextColor3 = THEME.subtext,
+			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
+		})
+	end
+	local switch = make("Frame", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(36, 16), Parent = row}, {corner(2), stroke(THEME.stroke, 1, 0)})
+	local knob = make("Frame", {BackgroundColor3 = THEME.subtext, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+		Rotation = 45, Position = UDim2.new(0, 9, 0.5, 0), Size = UDim2.fromOffset(10, 10), Parent = switch},
+		{corner(1), stroke(THEME.ember, 1, 1)})
+	local knobGlow = knob:FindFirstChildOfClass("UIStroke")
+	local rowStroke = row:FindFirstChildOfClass("UIStroke")
+	local onBar = make("Frame", {BackgroundColor3 = THEME.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(0, 3, 0, 0), Parent = row}, {corner(2)})
+	UI.hover(row, THEME.panel, THEME.panelHover)
+	local function paint(v, instant)
+		local info = instant and TweenInfo.new(0) or nil
+		tween(switch, {BackgroundColor3 = v and THEME.accent or THEME.bg}, info)
+		tween(knob, {Position = v and UDim2.new(1, -9, 0.5, 0) or UDim2.new(0, 9, 0.5, 0),
+			BackgroundColor3 = v and THEME.text or THEME.subtext, Rotation = v and 225 or 45}, info or SPRING)
+		tween(knobGlow, {Transparency = v and 0 or 1}, info)
+		tween(rowStroke, {Color = v and THEME.accent or THEME.stroke, Transparency = v and 0.35 or 0}, info)
+		tween(onBar, {Size = UDim2.new(0, 3, v and 0.55 or 0, 0)}, info)
+	end
+	paint(state[key], true)
+	local function set(on)
+		state[key] = on
+		paint(on)
+		if onChange then onChange(on) end
+		Settings.save()
+		UI.sfx(on and "on" or "off")
+	end
+	if state[key] and onChange then task.defer(function() pcall(onChange, true) end) end
+	toggleSetters[key] = set
+	track(row.Activated:Connect(function() set(not state[key]) end))
+end
+
+local function infoLabel(page, text, height)
+	return make("TextLabel", {
+		BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, height or 30),
+		Font = Enum.Font.Gotham, Text = text, TextSize = 11, TextColor3 = THEME.subtext, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+		LayoutOrder = #page:GetChildren(), Parent = page,
+	}, {corner(8), stroke(THEME.stroke, 1, 0), make("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)})})
+end
+
+local function rootOf(c) return c and c:FindFirstChild("HumanoidRootPart") end
+local function humOf(c) return c and c:FindFirstChildOfClass("Humanoid") end
+local function isAlive(c) local h = humOf(c); return h ~= nil and h.Health > 0 end
+local function teamOf(plr) return plr.Team and plr.Team.Name or "" end
+local function isKiller(plr) return teamOf(plr):lower():find("kill", 1, true) ~= nil end
+local function isVictim(plr) return teamOf(plr):lower():find("vict", 1, true) ~= nil end
+local function roundLive() return workspace:GetAttribute("Round") == true end
+local function confValue(char, name)
+	local conf = char and char:FindFirstChild("Conf")
+	local v = conf and conf:FindFirstChild(name)
+	return v and v.Value
+end
+
+local function nearestPlayer(maxDist, filter)
+	local myRoot = rootOf(localPlayer.Character)
+	if not myRoot then return nil end
+	local best, bestDist = nil, maxDist
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer and isAlive(plr.Character) and filter(plr) then
+			local r = rootOf(plr.Character)
+			local d = r and (r.Position - myRoot.Position).Magnitude
+			if d and d < bestDist then best, bestDist = plr, d end
+		end
+	end
+	return best, bestDist
+end
+
+local function teleportTo(cf)
+	local root = rootOf(localPlayer.Character)
+	if not root then return false end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.CFrame = cf
+	return true
+end
+
+local generators = {}
+local function genProgress(g)
+	local p = g:FindFirstChild("Progress")
+	local raw = (p and p:IsA("ValueBase") and tonumber(p.Value)) or 0
+	return math.min(100, raw / 90 * 100)
+end
+local function genPart(g)
+	return g.PrimaryPart or g:FindFirstChildWhichIsA("BasePart", true)
+end
+local function addGenerator(d)
+	if d:IsA("Model") and d.Name == "Generator" then generators[d] = true end
+end
+local genScan = {alive = true, lastRound = nil}
+onCleanup(function() genScan.alive = false end)
+function genScan.run()
+	for i, d in ipairs(workspace:GetDescendants()) do
+		addGenerator(d)
+		if i % 3000 == 0 then task.wait() end
+	end
+end
+task.spawn(function()
+	genScan.run()
+	while genScan.alive do
+		task.wait(5)
+		local round = workspace:GetAttribute("Round")
+		if round ~= genScan.lastRound then
+			genScan.lastRound = round
+			if round == true then
+				task.wait(3)
+				genScan.run()
+			end
+		end
+	end
+end)
+track(workspace.DescendantAdded:Connect(addGenerator))
+local function liveGenerators()
+	local list = {}
+	for g in pairs(generators) do
+		if not (g.Parent and g:IsDescendantOf(workspace)) then
+			generators[g] = nil
+		elseif genPart(g) then
+			table.insert(list, g)
+		end
+	end
+	return list
+end
+local function gatesList()
+	local list = {}
+	for _, g in ipairs(CollectionService:GetTagged("Gate")) do
+		if g:IsA("BasePart") and g:IsDescendantOf(workspace) then table.insert(list, g) end
+	end
+	return list
+end
+
+local mainPage = newTab("Main", 1, "settings")
+local victimPage = newTab("Victim", 2, "user")
+local killerPage = newTab("Killer", 3, "skull")
+local miscPage = newTab("Misc", 4, "wrench")
+
+local dangerBanner = make("TextLabel", {
+	BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.25, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 54), Size = UDim2.fromOffset(300, 28), Font = Enum.Font.GothamBlack,
+	TextSize = 14, TextColor3 = THEME.text, Text = "", Visible = false, Parent = gui,
+}, {corner(8), stroke(THEME.accent, 1)})
+
+header(mainPage, "VISUALS")
+toggle(mainPage, "Killer ESP", "killerEsp", "Red outline + name, distance through walls")
+toggle(mainPage, "Victim ESP", "victimEsp", "Green outline with their health")
+toggle(mainPage, "Generator ESP", "genEsp", "Yellow, shows repair progress (hides finished ones)")
+toggle(mainPage, "Exit gate ESP", "gateEsp", "Blue markers on the exit gates")
+header(mainPage, "ALERTS")
+toggle(mainPage, "Killer distance", "dangerMeter", "Banner with how far the nearest killer is")
+local statusLabel = infoLabel(mainPage, "...", 44)
+
+local espItems = {}
+local function removeEsp(key)
+	local e = espItems[key]
+	if e then
+		pcall(function() e.highlight:Destroy() end)
+		pcall(function() e.billboard:Destroy() end)
+		espItems[key] = nil
+	end
+end
+local function makeEsp(key, model, anchor)
+	removeEsp(key)
+	local highlight = make("Highlight", {Adornee = model, FillTransparency = 0.6, OutlineTransparency = 0,
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false, Parent = espFolder})
+	local billboard = make("BillboardGui", {Adornee = anchor, AlwaysOnTop = true, Size = UDim2.fromOffset(170, 34),
+		StudsOffset = Vector3.new(0, 2.6, 0), Enabled = false, Parent = espFolder})
+	local label = make("TextLabel", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Font = Enum.Font.GothamBold,
+		TextSize = 12, TextStrokeTransparency = 0.4, TextColor3 = THEME.text, Text = "", Parent = billboard})
+	local e = {highlight = highlight, billboard = billboard, label = label, model = model}
+	espItems[key] = e
+	return e
+end
+local function setEsp(e, show, color, text)
+	e.highlight.Enabled = show
+	e.billboard.Enabled = show
+	if show then
+		e.highlight.FillColor = color
+		e.highlight.OutlineColor = color
+		e.label.TextColor3 = color
+		e.label.Text = text
+	end
+end
+onCleanup(function() for k in pairs(espItems) do removeEsp(k) end end)
+track(Players.PlayerRemoving:Connect(removeEsp))
+
+local espTick = 0
+track(RunService.Heartbeat:Connect(function()
+	if os.clock() - espTick < 0.2 then return end
+	espTick = os.clock()
+	local myRoot = rootOf(localPlayer.Character)
+	local function dist(part) return (part and myRoot) and math.floor((part.Position - myRoot.Position).Magnitude) or 0 end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer then
+			local char = plr.Character
+			local e = espItems[plr]
+			if char and (not e or e.model ~= char) and char:FindFirstChild("Head") then
+				e = makeEsp(plr, char, char.Head)
+			end
+			if e then
+				local killer, victim = isKiller(plr), isVictim(plr)
+				local show = e.model.Parent ~= nil and isAlive(e.model)
+					and ((killer and state.killerEsp) or (victim and state.victimEsp))
+				local text = ""
+				if show then
+					local root = rootOf(e.model)
+					if killer then
+						text = string.format("%s\nKILLER  %dm", plr.DisplayName, dist(root))
+					else
+						local hp, max = confValue(e.model, "Health"), confValue(e.model, "MaxHealth")
+						text = string.format("%s\n%s  %dm", plr.DisplayName,
+							hp and string.format("%d/%d HP", hp, max or 0) or "Victim", dist(root))
+					end
+				end
+				setEsp(e, show, killer and COLORS.killer or COLORS.victim, text)
+			end
+		end
+	end
+
+	for _, g in ipairs(liveGenerators()) do
+		local e = espItems[g]
+		if not e then e = makeEsp(g, g, genPart(g)) end
+		local p = genProgress(g)
+		setEsp(e, state.genEsp and p < 100, COLORS.generator, string.format("Generator %d%%\n%dm", math.floor(p), dist(genPart(g))))
+	end
+	for _, gate in ipairs(gatesList()) do
+		local e = espItems[gate]
+		if not e then e = makeEsp(gate, gate, gate) end
+		setEsp(e, state.gateEsp, COLORS.gate, string.format("EXIT GATE\n%dm", dist(gate)))
+	end
+	for key, e in pairs(espItems) do
+		if typeof(key) == "Instance" and not key:IsA("Player") and not key:IsDescendantOf(workspace) then removeEsp(key) end
+	end
+end))
+
+track(RunService.Heartbeat:Connect(function()
+	local left = 0
+	for _, g in ipairs(liveGenerators()) do if genProgress(g) < 100 then left += 1 end end
+	local myTeam = teamOf(localPlayer)
+	statusLabel.Text = string.format("Round: %s   You: %s\nGenerators left: %d   Gates: %d", roundLive() and "live" or "lobby",
+		myTeam ~= "" and myTeam or "-", left, #gatesList())
+
+	if state.dangerMeter and isVictim(localPlayer) and roundLive() and rootOf(localPlayer.Character) then
+		local k, d = nearestPlayer(400, isKiller)
+		if k then
+			dangerBanner.Visible = true
+			dangerBanner.Text = string.format("%s  %dm", k.DisplayName, math.floor(d))
+			dangerBanner.TextColor3 = d < 20 and THEME.accent or d < 45 and THEME.warn or THEME.good
+			return
+		end
+	end
+	dangerBanner.Visible = false
+end))
+
+header(victimPage, "GENERATORS")
+toggle(victimPage, "Auto skill check", "autoSkill", "Presses Space when the bar is inside the zone")
+local vim = nil
+pcall(function() vim = game:GetService("VirtualInputManager") end)
+local skillPressAt = 0
+track(RunService.RenderStepped:Connect(function()
+	if not state.autoSkill or os.clock() - skillPressAt < 0.4 then return end
+	local pg = localPlayer:FindFirstChild("PlayerGui")
+	local holder = pg and pg:FindFirstChild("Elements")
+	holder = holder and holder:FindFirstChild("SkillCheck")
+	local sc = holder and holder:FindFirstChild("SkillCheck")
+	local bar = sc and sc:FindFirstChild("bar")
+	local zone = sc and sc:FindFirstChild("zone")
+	if not (bar and zone and sc.Visible) then return end
+	local bx, bw = bar.Position.X.Scale, bar.Size.X.Scale
+	local zx, zw = zone.Position.X.Scale, zone.Size.X.Scale
+	if bx >= zx + zw * 0.1 and bx + bw <= zx + zw * 0.85 then
+		skillPressAt = os.clock()
+		if vim then
+			pcall(function()
+				vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+				task.delay(0.03, function() vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+			end)
+		end
+	end
+end))
+if not vim then infoLabel(victimPage, "Your executor has no VirtualInputManager, auto skill check can't press keys.", 30) end
+
+header(victimPage, "VOID  (after your first death)")
+toggle(victimPage, "Auto collect souls", "autoSouls", "Grabs the 5 white orbs and walks into the exit")
+local function playerState(name)
+	local s = localPlayer:FindFirstChild("States")
+	return s and s:FindFirstChild(name)
+end
+local function inVoid()
+	local v = playerState("InVoid")
+	return v ~= nil and v.Value == true
+end
+local function pressSpace()
+	if not vim then return end
+	pcall(function()
+		vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+		task.delay(0.03, function() vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
+	end)
+end
+local function touchPart(part)
+	local root = rootOf(localPlayer.Character)
+	if not root then return end
+	teleportTo(CFrame.new(part.Position + Vector3.new(0, 1, 0)))
+	if typeof(firetouchinterest) == "function" then
+		pcall(firetouchinterest, root, part, 0)
+		task.wait(0.05)
+		pcall(firetouchinterest, root, part, 1)
+	end
+end
+
+local soulsAlive = true
+onCleanup(function() soulsAlive = false end)
+task.spawn(function()
+	while soulsAlive do
+		task.wait(0.3)
+		local gulag = workspace:FindFirstChild("Gulag")
+		local root = rootOf(localPlayer.Character)
+		if state.autoSouls and inVoid() and gulag and root and not root.Anchored then
+			local exit = gulag:FindFirstChild("Exit")
+			if exit and exit:IsA("BasePart") and exit.Transparency < 0.5 then
+				touchPart(exit)
+				task.wait(1)
+			else
+				local best, bestDist
+				for _, d in ipairs(gulag:GetDescendants()) do
+					if d:IsA("BasePart") and d.Name == "Soul" and d.Transparency < 0.5 then
+						local dist = (d.Position - root.Position).Magnitude
+						if not bestDist or dist < bestDist then best, bestDist = d, dist end
+					end
+				end
+				if best then
+					teleportTo(CFrame.new(best.Position + Vector3.new(0, 1, 0) - best.CFrame.LookVector * 2, best.Position))
+					task.wait(0.2)
+					pressSpace()
+					local t0 = os.clock()
+					while best.Parent and os.clock() - t0 < 3 do task.wait(0.1) end
+				end
+			end
+		end
+	end
+end)
+
+button(victimPage, "Escape the void now (skips the orbs)", function()
+	if not inVoid() then notify("DeathCrush", "You're not in the void"); return end
+	local rs = ReplicatedStorage:FindFirstChild("RemoteEvents")
+	local changeValue = rs and rs:FindFirstChild("Values") and rs.Values:FindFirstChild("ChangeValue")
+	local forceField = rs and rs:FindFirstChild("Instances") and rs.Instances:FindFirstChild("ForceField")
+	if not changeValue then notify("DeathCrush", "ChangeValue remote not found", THEME.red); return end
+	local spawns = {}
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name == "spawn" then table.insert(spawns, d) end
+	end
+	if forceField then pcall(function() forceField:FireServer(15) end) end
+	pcall(function() changeValue:FireServer(playerState("InVoid"), false) end)
+	pcall(function() changeValue:FireServer(playerState("Unable"), false) end)
+	local hum = humOf(localPlayer.Character)
+	local cam = workspace.CurrentCamera
+	if hum then cam.CameraType = Enum.CameraType.Custom; cam.CameraSubject = hum end
+	if #spawns > 0 then teleportTo(CFrame.new(spawns[math.random(#spawns)].Position + Vector3.new(0, 3, 0))) end
+	notify("DeathCrush", "Escaped the void", THEME.good)
+end)
+
+header(victimPage, "MOVEMENT")
+toggle(victimPage, "Infinite stamina", "infStamina", "Keeps your sprint bar full")
+track(RunService.Heartbeat:Connect(function()
+	if not state.infStamina then return end
+	local conf = localPlayer.Character and localPlayer.Character:FindFirstChild("Conf")
+	local s, m = conf and conf:FindFirstChild("Stamina"), conf and conf:FindFirstChild("maxStamina")
+	if s and m and s.Value < m.Value then s.Value = m.Value end
+end))
+
+header(victimPage, "TELEPORTS  (can be risky if the game checks)")
+local function tpGenerator()
+	local myRoot = rootOf(localPlayer.Character)
+	if not myRoot then return end
+	local best, bestDist
+	for _, g in ipairs(liveGenerators()) do
+		local part = genPart(g)
+		local d = (part.Position - myRoot.Position).Magnitude
+		if genProgress(g) < 100 and (not bestDist or d < bestDist) then best, bestDist = g, d end
+	end
+	if not best then notify("DeathCrush", "No unfinished generator found"); return end
+	local cf = genPart(best).CFrame
+	teleportTo(CFrame.new(cf.Position + cf.LookVector * 4 + Vector3.new(0, 2, 0), cf.Position))
+	notify("DeathCrush", string.format("Teleported to a generator (%d%%)", math.floor(genProgress(best))), THEME.good)
+end
+local function tpGate()
+	local myRoot = rootOf(localPlayer.Character)
+	if not myRoot then return end
+	local best, bestDist
+	for _, g in ipairs(gatesList()) do
+		local d = (g.Position - myRoot.Position).Magnitude
+		if not bestDist or d < bestDist then best, bestDist = g, d end
+	end
+	if not best then notify("DeathCrush", "No exit gate in this map right now"); return end
+	teleportTo(CFrame.new(best.Position + Vector3.new(0, 3, 0)))
+	notify("DeathCrush", "Teleported to the exit gate (press F to open)", THEME.good)
+end
+local grid = buttonGrid(victimPage)
+button(victimPage, "Nearest generator", tpGenerator, grid)
+button(victimPage, "Nearest exit gate", tpGate, grid)
+
+header(killerPage, "ATTACK")
+toggle(killerPage, "Kill aura", "killAura", "Hits any victim inside the range, one hit every 1.6 s")
+local auraBtn
+local function auraText() return string.format("Aura range: %d studs   (click = +1, right click = -1)", AURA_RANGE) end
+auraBtn = button(killerPage, auraText(), function()
+	AURA_RANGE = math.clamp(AURA_RANGE + 1, 4, 20)
+	auraBtn.Text = auraText()
+	Settings.save()
+end)
+track(auraBtn.MouseButton2Click:Connect(function()
+	AURA_RANGE = math.clamp(AURA_RANGE - 1, 4, 20)
+	auraBtn.Text = auraText()
+	Settings.save()
+end))
+infoLabel(killerPage, "The game's own swing reaches about 4 studs. Bigger range = easier to get caught.", 30)
+
+local m1Remote = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("M1")
+local lastHit = 0
+track(RunService.Heartbeat:Connect(function()
+	if not state.killAura or not m1Remote or os.clock() - lastHit < 1.6 then return end
+	if not isKiller(localPlayer) or not isAlive(localPlayer.Character) then return end
+	local target = nearestPlayer(AURA_RANGE, function(p)
+		local c = p.Character
+		return isVictim(p) and c:FindFirstChildOfClass("ForceField") == nil and (confValue(c, "Health") or 1) > 0
+	end)
+	if target then
+		lastHit = os.clock()
+		pcall(function() m1Remote:FireServer(target.Character) end)
+	end
+end))
+
+header(killerPage, "MOVEMENT")
+toggle(killerPage, "Fast vault / vent", "fastVault", "Climbs windows and vents 2.5x faster (works for victims too)")
+toggle(killerPage, "No slowdowns", "noSlow", "Blocks the speed drops after vaulting, swinging, failed checks")
+local Speed = {vaultAnims = {Vault = true, Vent = true, SlideVent = true, OpenVent = true}, factor = 2.5, dead = false, ours = {}}
+onCleanup(function() Speed.dead = true end)
+
+function Speed.boostAnims()
+	local hum = humOf(localPlayer.Character)
+	local animator = hum and hum:FindFirstChildOfClass("Animator")
+	if not animator then return end
+	for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+		local a = tr.Animation
+		if a and Speed.vaultAnims[a.Name] and not tr:GetAttribute("DCFast") then
+			pcall(function()
+				tr:SetAttribute("DCFast", true)
+				tr:AdjustSpeed(tr.Speed * Speed.factor)
+			end)
+		end
+	end
+end
+
+if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+	local isOurs = typeof(checkcaller) == "function" and checkcaller or function() return false end
+	local wrap = typeof(newcclosure) == "function" and newcclosure or function(f) return f end
+	local old
+	old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+		if self == TweenService and not Speed.dead and state.fastVault and not isOurs() and getnamecallmethod() == "Create" then
+			local obj, info, props = ...
+			local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if obj == root and typeof(info) == "TweenInfo" and type(props) == "table" and props.CFrame then
+				info = TweenInfo.new(info.Time / Speed.factor, info.EasingStyle, info.EasingDirection,
+					info.RepeatCount, info.Reverses, info.DelayTime)
+				task.defer(Speed.boostAnims)
+				return old(self, obj, info, props)
+			end
+		end
+		return old(self, ...)
+	end))
+else
+	infoLabel(killerPage, "Your executor can't hook calls, fast vault won't work.", 30)
+end
+
+function Speed.isSlowdown(...)
+	local args = {...}
+	if typeof(args[1]) == "Instance" and args[1]:IsA("Player") then table.remove(args, 1) end
+	local op, value = args[1], tonumber(args[2])
+	if typeof(op) == "boolean" or not value then return false end
+	if op == "=" then return value < 16 end
+	if op == "-" then return value > 0 end
+	if op == "*" then return value < 1 end
+	if op == "/" then return value > 1 end
+	return false
+end
+
+function Speed.hookSignal(signal)
+	if typeof(getconnections) ~= "function" then return 0 end
+	local ok, conns = pcall(getconnections, signal)
+	if not ok then return 0 end
+	local n = 0
+	for _, c in ipairs(conns) do
+		local fn = c.Function
+		if fn and not Speed.ours[fn] and pcall(function() c:Disable() end) then
+			n += 1
+			local wrapper
+			wrapper = function(...)
+				if state.noSlow and not Speed.dead and Speed.isSlowdown(...) then return end
+				return fn(...)
+			end
+			Speed.ours[wrapper] = true
+			track(signal:Connect(wrapper))
+			onCleanup(function() pcall(function() c:Enable() end) end)
+		end
+	end
+	return n
+end
+
+function Speed.hookAll()
+	local rs = ReplicatedStorage:FindFirstChild("RemoteEvents")
+	local remoteEv = rs and rs:FindFirstChild("SpeedChanger")
+	local bindables = rs and rs:FindFirstChild("Bindables")
+	local localEv = bindables and bindables:FindFirstChild("SpeedChangerLocal")
+	local n = 0
+	if remoteEv then n += Speed.hookSignal(remoteEv.OnClientEvent) end
+	if localEv then n += Speed.hookSignal(localEv.Event) end
+	return n
+end
+if typeof(getconnections) ~= "function" then
+	infoLabel(killerPage, "Your executor has no getconnections, no slowdowns won't work.", 30)
+else
+	task.spawn(Speed.hookAll)
+	track(localPlayer.CharacterAdded:Connect(function()
+		task.wait(3)
+		Speed.hookAll()
+	end))
+end
+
+header(killerPage, "TELEPORTS")
+local kgrid = buttonGrid(killerPage)
+button(killerPage, "Nearest victim", function()
+	local v = nearestPlayer(math.huge, isVictim)
+	local r = v and rootOf(v.Character)
+	if not r then notify("DeathCrush", "No victim alive"); return end
+	teleportTo(r.CFrame * CFrame.new(0, 0, 3))
+	notify("DeathCrush", "Teleported behind " .. v.DisplayName, THEME.good)
+end, kgrid)
+button(killerPage, "Nearest generator", tpGenerator, kgrid)
+
+local function turnAllOff()
+	local off = {}
+	for key, set in pairs(toggleSetters) do
+		if state[key] and key ~= "dangerMeter" then
+			pcall(set, false)
+			table.insert(off, key)
+		end
+	end
+	return off
+end
+header(victimPage, "CHESTS")
+toggle(victimPage, "Auto open all chests", "autoChest", "Opens every chest on the map from anywhere, no hold, no noise")
+local Chests = {range = math.huge, busy = false, tried = {}}
+function Chests.remote()
+	local rs = ReplicatedStorage:FindFirstChild("RemoteEvents")
+	return rs and rs:FindFirstChild("Chest")
+end
+function Chests.usable(c)
+	local u = c:FindFirstChild("Unable")
+	return c.Parent ~= nil and not (u and u.Value)
+end
+function Chests.all()
+	local list = {}
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name == "Chest" and Chests.usable(d) then table.insert(list, d) end
+	end
+	return list
+end
+function Chests.open(c)
+	local ev = Chests.remote()
+	if not ev then return false end
+	pcall(function() ev:FireServer("Lock", c) end)
+	task.wait(0.2)
+	pcall(function() ev:FireServer("Open", c) end)
+	task.wait(0.6)
+	return not Chests.usable(c)
+end
+
+local chestList = {}
+track(workspace.DescendantAdded:Connect(function(d)
+	if d:IsA("BasePart") and d.Name == "Chest" then chestList[d] = true end
+end))
+task.spawn(function()
+	for i, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name == "Chest" then chestList[d] = true end
+		if i % 3000 == 0 then task.wait() end
+	end
+end)
+local chestTick = 0
+track(RunService.Heartbeat:Connect(function()
+	if not state.autoChest or Chests.busy or os.clock() - chestTick < 0.5 then return end
+	chestTick = os.clock()
+	if not isVictim(localPlayer) then return end
+	local root = rootOf(localPlayer.Character)
+	if not root then return end
+	for c in pairs(chestList) do
+		if not c.Parent then
+			chestList[c] = nil
+		elseif Chests.usable(c) and (Chests.tried[c] or 0) < os.clock() - 10
+			and (c.Position - root.Position).Magnitude <= Chests.range then
+			Chests.tried[c] = os.clock()
+			Chests.busy = true
+			task.spawn(function()
+				if Chests.open(c) then notify("DeathCrush", "Opened a chest", THEME.good) end
+				Chests.busy = false
+			end)
+			return
+		end
+	end
+end))
+
+button(victimPage, "Open every chest on the map", function()
+	if Chests.busy then return end
+	if not isVictim(localPlayer) then notify("DeathCrush", "Only victims can open chests"); return end
+	local root = rootOf(localPlayer.Character)
+	if not root then return end
+	Chests.busy = true
+	local home = root.CFrame
+	local opened, total = 0, 0
+	for _, c in ipairs(Chests.all()) do
+		total += 1
+		local ok = Chests.open(c)
+		if not ok then
+			teleportTo(CFrame.new(c.Position + Vector3.new(0, 3, 0) - c.CFrame.LookVector * 3, c.Position))
+			task.wait(0.3)
+			ok = Chests.open(c)
+		end
+		if ok then opened += 1 end
+	end
+	if total > 0 then teleportTo(home) end
+	Chests.busy = false
+	notify("DeathCrush", total == 0 and "No closed chests on the map" or string.format("Opened %d of %d chests", opened, total),
+		opened > 0 and THEME.good or THEME.warn)
+end)
+
+header(miscPage, "OTHER")
+button(miscPage, "Turn everything off", function()
+	local off = turnAllOff()
+	notify("DeathCrush", #off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")
+end)
+infoLabel(miscPage, "Speed, fly, noclip and the rest live in the main menu.", 30)
+
+_G.DeathCrushPanic = turnAllOff
+_G.DeathCrushCleanup = function()
+	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	table.clear(connections)
+	for _, fn in ipairs(cleanupTasks) do pcall(fn) end
+	table.clear(cleanupTasks)
+	if gui then gui:Destroy() end
+	_G.DeathCrushCleanup = nil
+	_G.DeathCrushPanic = nil
+end
+track(closeBtn.Activated:Connect(function() _G.DeathCrushCleanup() end))
+
+selectTab("Main")
