@@ -5365,6 +5365,12 @@ tools.run("Games tab", function()
 			file = "blindbutdangerous.lua",
 			url = "https://raw.githubusercontent.com/johncock120-wq/scripts/main/blindbutdangerous.txt",
 		},
+		{
+			name = "DeathCrush",
+			placeId = 18240434416,
+			file = "deathcrush.lua",
+			url = "https://raw.githubusercontent.com/johncock120-wq/scripts/main/deathcrush.txt",
+		},
 	}
 	local canReadFiles = typeof(readfile) == "function" and typeof(isfile) == "function"
 	local loadingGame = false
@@ -6065,10 +6071,12 @@ tools.run("Admin detector", function()
 			table.insert(off, "Orbit")
 		end
 		loadingSettings = wasLoading
-		if type(_G.FightClubPanic) == "function" then
-			local ok, fc = pcall(_G.FightClubPanic)
-			if ok and type(fc) == "table" then
-				for _, k in ipairs(fc) do table.insert(off, "Fight Club " .. k) end
+		for _, panic in ipairs({{"FightClubPanic", "Fight Club "}, {"DeathCrushPanic", "DeathCrush "}}) do
+			if type(_G[panic[1]]) == "function" then
+				local ok, list = pcall(_G[panic[1]])
+				if ok and type(list) == "table" then
+					for _, k in ipairs(list) do table.insert(off, panic[2] .. k) end
+				end
 			end
 		end
 		return off
