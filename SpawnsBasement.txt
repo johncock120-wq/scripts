@@ -5357,13 +5357,13 @@ tools.run("Games tab", function()
 			name = "Fight Club",
 			placeId = 118869170110643,
 			file = "fightclub.lua",
-			url = "",
+			url = "https://raw.githubusercontent.com/johncock120-wq/scripts/main/fightclub.txt",
 		},
 		{
 			name = "Blind but Dangerous",
 			placeId = 112270456220062,
 			file = "blindbutdangerous.lua",
-			url = "",
+			url = "https://raw.githubusercontent.com/johncock120-wq/scripts/main/blindbutdangerous.txt",
 		},
 	}
 	local canReadFiles = typeof(readfile) == "function" and typeof(isfile) == "function"
