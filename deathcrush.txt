@@ -34,6 +34,7 @@ local COLORS = {
 local state = {
 	killerEsp = true, victimEsp = false, genEsp = false, gateEsp = false, dangerMeter = true,
 	autoSkill = false, infStamina = false, killAura = false, autoSouls = false, fastVault = false, noSlow = false, autoChest = false,
+	speedOn = false, jumpOn = false,
 }
 local Settings = {file = "DeathCrushSettings.json", data = {}, extra = {}}
 do
@@ -437,6 +438,10 @@ do
 		end
 
 		track(minBtn.Activated:Connect(function() UI.sfx("click"); minimize() end))
+		track(UserInputService.InputBegan:Connect(function(input, processed)
+			if processed or input.KeyCode ~= Enum.KeyCode.RightControl then return end
+			if minimized then restore() else minimize() end
+		end))
 		onCleanup(function() if tabHolder then tabHolder:Destroy() end end)
 	end
 
@@ -720,7 +725,8 @@ end
 local mainPage = newTab("Main", 1, "settings")
 local victimPage = newTab("Victim", 2, "user")
 local killerPage = newTab("Killer", 3, "skull")
-local miscPage = newTab("Misc", 4, "wrench")
+local tpPage = newTab("Teleport", 4, "globe")
+local miscPage = newTab("Misc", 5, "wrench")
 
 local dangerBanner = make("TextLabel", {
 	BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.25, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0),
@@ -957,7 +963,27 @@ track(RunService.Heartbeat:Connect(function()
 	if s and m and s.Value < m.Value then s.Value = m.Value end
 end))
 
-header(victimPage, "TELEPORTS  (can be risky if the game checks)")
+header(tpPage, "NEAREST  (can be risky if the game checks)")
+local function genStand(part)
+	-- stand on the back side of the generator; if a wall is there, fall back to the front
+	local cf = part.CFrame
+	local center = cf.Position + Vector3.new(0, 2, 0)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {part:FindFirstAncestorOfClass("Model") or part, localPlayer.Character}
+	for _, dir in ipairs({-cf.LookVector, cf.LookVector, cf.RightVector, -cf.RightVector}) do
+		local flat = Vector3.new(dir.X, 0, dir.Z)
+		if flat.Magnitude > 0.1 then
+			flat = flat.Unit
+			if not workspace:Raycast(center, flat * 5, params) then
+				local spot = center + flat * 4
+				return CFrame.new(spot, Vector3.new(cf.Position.X, spot.Y, cf.Position.Z))
+			end
+		end
+	end
+	local spot = center - cf.LookVector * 4
+	return CFrame.new(spot, Vector3.new(cf.Position.X, spot.Y, cf.Position.Z))
+end
 local function tpGenerator()
 	local myRoot = rootOf(localPlayer.Character)
 	if not myRoot then return end
@@ -968,8 +994,8 @@ local function tpGenerator()
 		if genProgress(g) < 100 and (not bestDist or d < bestDist) then best, bestDist = g, d end
 	end
 	if not best then notify("DeathCrush", "No unfinished generator found"); return end
-	local cf = genPart(best).CFrame
-	teleportTo(CFrame.new(cf.Position + cf.LookVector * 4 + Vector3.new(0, 2, 0), cf.Position))
+	local part = genPart(best)
+	teleportTo(genStand(part))
 	notify("DeathCrush", string.format("Teleported to a generator (%d%%)", math.floor(genProgress(best))), THEME.good)
 end
 local function tpGate()
@@ -984,9 +1010,124 @@ local function tpGate()
 	teleportTo(CFrame.new(best.Position + Vector3.new(0, 3, 0)))
 	notify("DeathCrush", "Teleported to the exit gate (press F to open)", THEME.good)
 end
-local grid = buttonGrid(victimPage)
-button(victimPage, "Nearest generator", tpGenerator, grid)
-button(victimPage, "Nearest exit gate", tpGate, grid)
+local function tpNearest(filter, what)
+	local p = nearestPlayer(math.huge, filter)
+	local r = p and rootOf(p.Character)
+	if not r then notify("DeathCrush", "No " .. what .. " alive"); return end
+	teleportTo(r.CFrame * CFrame.new(0, 0, 3))
+	notify("DeathCrush", "Teleported behind " .. p.DisplayName, THEME.good)
+end
+local grid = buttonGrid(tpPage)
+button(tpPage, "Nearest generator", tpGenerator, grid)
+button(tpPage, "Nearest exit gate", tpGate, grid)
+button(tpPage, "Nearest victim", function() tpNearest(isVictim, "victim") end, grid)
+button(tpPage, "Nearest killer", function() tpNearest(isKiller, "killer") end, grid)
+
+local function tpToGen(i, g)
+	local part = g.Parent and genPart(g)
+	if not part then notify("DeathCrush", "That generator is gone", THEME.red); return end
+	teleportTo(genStand(part))
+	notify("DeathCrush", string.format("Teleported to generator %d (%d%%)", i, math.floor(genProgress(g))), THEME.good)
+end
+local function tpToGate(i, g)
+	if not g.Parent then notify("DeathCrush", "That gate is gone", THEME.red); return end
+	teleportTo(CFrame.new(g.Position + Vector3.new(0, 3, 0)))
+	notify("DeathCrush", string.format("Teleported to exit gate %d (press F to open)", i), THEME.good)
+end
+local function byPosition(posOf)
+	return function(a, b)
+		local pa, pb = posOf(a), posOf(b)
+		if math.abs(pa.X - pb.X) > 0.5 then return pa.X < pb.X end
+		return pa.Z < pb.Z
+	end
+end
+local function sortedGens()
+	local list = liveGenerators()
+	table.sort(list, byPosition(function(g) return genPart(g).Position end))
+	return list
+end
+local function sortedGates()
+	local list = gatesList()
+	table.sort(list, byPosition(function(g) return g.Position end))
+	return list
+end
+local function genLabel(i, g)
+	local p = genProgress(g)
+	return p >= 100 and string.format("Gen %d  done", i) or string.format("Gen %d  %d%%", i, math.floor(p))
+end
+local function gateLabel(i) return "Exit gate " .. i end
+
+local listsAlive = true
+onCleanup(function() listsAlive = false end)
+local function liveList(page, title, getList, label, go, emptyText, decorate)
+	header(page, title)
+	local grid = buttonGrid(page)
+	local empty = make("TextLabel", {BackgroundTransparency = 1, Name = "000", LayoutOrder = 0, Font = Enum.Font.Gotham,
+		Text = emptyText, TextSize = 11, TextColor3 = THEME.subtext, TextXAlignment = Enum.TextXAlignment.Left, Parent = grid})
+	local items, btns = {}, {}
+	local function same(list)
+		if #list ~= #items then return false end
+		for i, v in ipairs(list) do if items[i] ~= v then return false end end
+		return true
+	end
+	task.spawn(function()
+		while listsAlive do
+			local list = getList()
+			if not same(list) then
+				for _, b in ipairs(btns) do b:Destroy() end
+				table.clear(btns)
+				items = list
+				for i, obj in ipairs(list) do
+					local b = button(page, label(i, obj), function() go(i, obj) end, grid)
+					b.LayoutOrder, b.Name = i, string.format("%03d", i)
+					if decorate then decorate(b, obj) end
+					btns[i] = b
+				end
+				empty.Visible = #list == 0
+			else
+				for i, obj in ipairs(items) do btns[i].Text = label(i, obj) end
+			end
+			task.wait(1)
+		end
+	end)
+end
+liveList(tpPage, "GENERATORS", sortedGens, genLabel, tpToGen, "No generators on this map")
+liveList(tpPage, "EXIT GATES", sortedGates, gateLabel, tpToGate, "No exit gates right now")
+
+local headshots = {}
+local function sortedPlayers()
+	local list = {}
+	for _, p in ipairs(Players:GetPlayers()) do if p ~= localPlayer then table.insert(list, p) end end
+	table.sort(list, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+	return list
+end
+local function playerLabel(_, p)
+	local tag = isKiller(p) and "  (killer)" or (isAlive(p.Character) and "" or "  (dead)")
+	return p.DisplayName .. tag
+end
+local function tpToPlayer(_, p)
+	local r = p.Parent and rootOf(p.Character)
+	if not r then notify("DeathCrush", p.DisplayName .. " has no character right now", THEME.red); return end
+	teleportTo(r.CFrame * CFrame.new(0, 0, 3))
+	notify("DeathCrush", "Teleported to " .. p.DisplayName, THEME.good)
+end
+local function playerDecorate(b, p)
+	local pad = b:FindFirstChildOfClass("UIPadding")
+	if pad then pad.PaddingLeft = UDim.new(0, 30) end
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.TextColor3 = isKiller(p) and COLORS.killer or THEME.text
+	local img = make("ImageLabel", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, -26, 0.5, 0), Size = UDim2.fromOffset(22, 22), Image = headshots[p.UserId] or "", Parent = b},
+		{corner(11), stroke(isKiller(p) and COLORS.killer or THEME.stroke, 1, 0)})
+	if not headshots[p.UserId] then
+		task.spawn(function()
+			local ok, url = pcall(Players.GetUserThumbnailAsync, Players, p.UserId,
+				Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+			if ok then headshots[p.UserId] = url; if img.Parent then img.Image = url end end
+		end)
+	end
+end
+liveList(tpPage, "PLAYERS", sortedPlayers, playerLabel, tpToPlayer, "Nobody else in the server", playerDecorate)
 
 header(killerPage, "ATTACK")
 toggle(killerPage, "Kill aura", "killAura", "Hits any victim inside the range, one hit every 1.6 s")
@@ -1115,17 +1256,6 @@ else
 	end))
 end
 
-header(killerPage, "TELEPORTS")
-local kgrid = buttonGrid(killerPage)
-button(killerPage, "Nearest victim", function()
-	local v = nearestPlayer(math.huge, isVictim)
-	local r = v and rootOf(v.Character)
-	if not r then notify("DeathCrush", "No victim alive"); return end
-	teleportTo(r.CFrame * CFrame.new(0, 0, 3))
-	notify("DeathCrush", "Teleported behind " .. v.DisplayName, THEME.good)
-end, kgrid)
-button(killerPage, "Nearest generator", tpGenerator, kgrid)
-
 local function turnAllOff()
 	local off = {}
 	for key, set in pairs(toggleSetters) do
@@ -1221,12 +1351,192 @@ button(victimPage, "Open every chest on the map", function()
 		opened > 0 and THEME.good or THEME.warn)
 end)
 
+local Move = {speed = 24, jump = 15, hum = nil, gameSpeed = nil, appliedSpeed = nil, gameJump = nil, appliedJump = nil}
+Move.speed = tonumber(Settings.value("walkSpeed", function() return Move.speed end)) or Move.speed
+Move.jump = tonumber(Settings.value("jumpHeight", function() return Move.jump end)) or Move.jump
+function Move.jumpProp(hum) return hum.UseJumpPower and "JumpPower" or "JumpHeight" end
+function Move.jumpTarget(hum)
+	return hum.UseJumpPower and math.sqrt(2 * workspace.Gravity * Move.jump) or Move.jump
+end
+function Move.restoreSpeed()
+	local hum = Move.hum
+	if hum and hum.Parent and Move.gameSpeed then hum.WalkSpeed = Move.gameSpeed end
+	Move.gameSpeed, Move.appliedSpeed = nil, nil
+end
+function Move.restoreJump()
+	local hum = Move.hum
+	if hum and hum.Parent and Move.gameJump then hum[Move.jumpProp(hum)] = Move.gameJump end
+	Move.gameJump, Move.appliedJump = nil, nil
+end
+onCleanup(function() Move.restoreSpeed(); Move.restoreJump() end)
+
+header(miscPage, "MOVEMENT")
+toggle(miscPage, "Speed", "speedOn", "Holds your walk speed at the value below (not while the game freezes you)", function(on)
+	if not on then Move.restoreSpeed() end
+end)
+local speedBtn
+local function speedText() return string.format("Walk speed: %d   (click = +2, right click = -2)", Move.speed) end
+speedBtn = button(miscPage, speedText(), function()
+	Move.speed = math.clamp(Move.speed + 2, 8, 120)
+	speedBtn.Text = speedText()
+	Settings.save()
+end)
+track(speedBtn.MouseButton2Click:Connect(function()
+	Move.speed = math.clamp(Move.speed - 2, 8, 120)
+	speedBtn.Text = speedText()
+	Settings.save()
+end))
+toggle(miscPage, "Jump height", "jumpOn", "Lets you jump even where the game turns jumping off", function(on)
+	if not on then Move.restoreJump() end
+end)
+local jumpBtn
+local function jumpText() return string.format("Jump height: %d studs   (click = +1, right click = -1)", Move.jump) end
+jumpBtn = button(miscPage, jumpText(), function()
+	Move.jump = math.clamp(Move.jump + 1, 2, 80)
+	jumpBtn.Text = jumpText()
+	Settings.save()
+end)
+track(jumpBtn.MouseButton2Click:Connect(function()
+	Move.jump = math.clamp(Move.jump - 1, 2, 80)
+	jumpBtn.Text = jumpText()
+	Settings.save()
+end))
+infoLabel(miscPage, "Normal: speed 16, jump ~7 studs. Big values are easy for others to notice.", 30)
+
+track(RunService.Heartbeat:Connect(function()
+	local hum = humOf(localPlayer.Character)
+	if not hum then return end
+	if hum ~= Move.hum then
+		Move.hum = hum
+		Move.gameSpeed, Move.appliedSpeed, Move.gameJump, Move.appliedJump = nil, nil, nil, nil
+	end
+	if state.speedOn and hum.WalkSpeed > 0 and hum.WalkSpeed ~= Move.speed then
+		if hum.WalkSpeed ~= Move.appliedSpeed then Move.gameSpeed = hum.WalkSpeed end
+		hum.WalkSpeed = Move.speed
+		Move.appliedSpeed = Move.speed
+	end
+	if state.jumpOn then
+		if not hum:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+			pcall(hum.SetStateEnabled, hum, Enum.HumanoidStateType.Jumping, true)
+		end
+		local prop, target = Move.jumpProp(hum), Move.jumpTarget(hum)
+		local cur = hum[prop]
+		if math.abs(cur - target) > 0.01 then
+			if not Move.appliedJump or math.abs(cur - Move.appliedJump) > 0.01 then Move.gameJump = cur end
+			hum[prop] = target
+			Move.appliedJump = target
+		end
+	end
+end))
+
 header(miscPage, "OTHER")
 button(miscPage, "Turn everything off", function()
 	local off = turnAllOff()
 	notify("DeathCrush", #off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")
 end)
-infoLabel(miscPage, "Speed, fly, noclip and the rest live in the main menu.", 30)
+infoLabel(miscPage, "Fly, noclip and the rest live in the main menu.", 30)
+
+-- Admin detection. Runs on its own so it still protects you when the main hub menu isn't open.
+-- If the hub is open, its own detector shows the alert and calls our panic, so this one stays quiet.
+do
+	local ROBLOX_STAFF_GROUP = 1200769
+	local STAFF_WORDS = {"admin", "mod", "staff", "owner", "founder", "developer", "dev", "creator", "manager", "helper", "head"}
+	local alerted = {}
+	local holder = make("Frame", {BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 20), Size = UDim2.new(0, 460, 1, -40), Parent = UI.toastGui,
+	}, {make("UIListLayout", {Padding = UDim.new(0, 8), HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder})})
+	local count = 0
+
+	local function reasonsFor(plr)
+		local reasons, isOwner = {}, false
+		if game.CreatorType == Enum.CreatorType.User and plr.UserId == game.CreatorId then
+			isOwner = true
+			table.insert(reasons, "Owns this game")
+		elseif game.CreatorType == Enum.CreatorType.Group then
+			local okR, rank = pcall(plr.GetRankInGroup, plr, game.CreatorId)
+			local okN, role = pcall(plr.GetRoleInGroup, plr, game.CreatorId)
+			rank = okR and rank or 0
+			role = okN and role or "?"
+			local staffWord = false
+			for _, w in ipairs(STAFF_WORDS) do
+				if role:lower():find(w, 1, true) then staffWord = true; break end
+			end
+			if rank == 255 then
+				isOwner = true
+				table.insert(reasons, "Owns this game (owner of the game's group: " .. role .. ")")
+			elseif rank >= 254 then
+				table.insert(reasons, "Top rank in the game's group: " .. role .. " (" .. rank .. ")")
+			elseif rank > 0 and staffWord then
+				table.insert(reasons, "Staff role in the game's group: " .. role .. " (" .. rank .. ")")
+			elseif rank >= 200 then
+				table.insert(reasons, "High rank in the game's group: " .. role .. " (" .. rank .. ")")
+			end
+		end
+		local okS, inStaff = pcall(plr.IsInGroup, plr, ROBLOX_STAFF_GROUP)
+		if okS and inStaff then table.insert(reasons, "Roblox staff member") end
+		return reasons, isOwner
+	end
+
+	local function showAlert(plr, reasons, isOwner, wasHere, off)
+		count += 1
+		local card = make("Frame", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 120),
+			LayoutOrder = count, Parent = holder}, {corner(12)})
+		local border = stroke(THEME.accent, 3, 0)
+		border.Parent = card
+		TweenService:Create(border, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{Transparency = 0.7}):Play()
+		local avatar = make("ImageLabel", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+			Position = UDim2.new(0, 14, 0.5, -36), Size = UDim2.fromOffset(72, 72), Parent = card}, {corner(36)})
+		task.spawn(function()
+			local ok, img = pcall(Players.GetUserThumbnailAsync, Players, plr.UserId,
+				Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+			if ok and avatar.Parent then avatar.Image = img end
+		end)
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 8), Size = UDim2.new(1, -150, 0, 26),
+			Font = Enum.Font.GothamBlack, Text = isOwner and "GAME OWNER DETECTED" or "ADMIN DETECTED", TextSize = 20,
+			TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Left, Parent = card})
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 34), Size = UDim2.new(1, -110, 0, 18),
+			Font = Enum.Font.GothamBold, Text = plr.DisplayName .. "  (@" .. plr.Name .. ")", TextSize = 15,
+			TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 54), Size = UDim2.new(1, -110, 0, 30),
+			Font = Enum.Font.GothamMedium, Text = table.concat(reasons, "\n"), TextSize = 12,
+			TextColor3 = Color3.fromRGB(255, 170, 170), TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top, Parent = card})
+		local status = make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 100, 1, -30),
+			Size = UDim2.new(1, -110, 0, 26), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.subtext,
+			TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = card,
+			Text = (wasHere and "Already in the server" or "Joined") .. " at " .. os.date("%H:%M:%S") .. "  ·  "
+				.. (#off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")})
+		local close = make("TextButton", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8), Size = UDim2.fromOffset(28, 28),
+			Font = Enum.Font.GothamBold, Text = "×", TextSize = 20, TextColor3 = THEME.text, Parent = card},
+			{corner(6), stroke(THEME.accent, 1, 0.3)})
+		track(close.Activated:Connect(function() UI.sfx("click"); card:Destroy() end))
+		track(Players.PlayerRemoving:Connect(function(p)
+			if p == plr and status.Parent then
+				status.Text = status.Text .. "  ·  left at " .. os.date("%H:%M:%S")
+				status.TextColor3 = THEME.good
+			end
+		end))
+		task.spawn(function()
+			for _ = 1, 3 do UI.sfx("error"); task.wait(0.25) end
+		end)
+	end
+
+	local function check(plr, wasHere)
+		if plr == localPlayer or alerted[plr] then return end
+		local reasons, isOwner = reasonsFor(plr)
+		if #reasons == 0 or not plr.Parent or not gui.Parent then return end
+		alerted[plr] = true
+		if type(_G.PlayerAnnoyerCleanup) == "function" then return end
+		local okOff, off = pcall(turnAllOff)
+		showAlert(plr, reasons, isOwner, wasHere, okOff and type(off) == "table" and off or {})
+	end
+
+	for _, p in ipairs(Players:GetPlayers()) do task.spawn(check, p, true) end
+	track(Players.PlayerAdded:Connect(function(p) task.spawn(check, p, false) end))
+end
 
 _G.DeathCrushPanic = turnAllOff
 _G.DeathCrushCleanup = function()

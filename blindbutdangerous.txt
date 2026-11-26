@@ -36,7 +36,8 @@ local state = {
 	esp = false, espLobby = false, whistleWarn = true, dangerMeter = true,
 	fullVision = false, autoBat = false, autoEquip = false, faceTarget = false,
 	autoPush = false, autoSneak = false, antiKnockback = false, autoGrab = false, autoEscape = false, autoTrapEscape = false, trapEsp = false, bananaEsp = false,
-	knifeAim = false, shotgunAim = false,
+	knifeAim = false, shotgunAim = false, noShake = false, noStun = false, noRecoil = false, thirdPerson = false, noIce = false,
+	speedOn = false, jumpOn = false,
 }
 local Settings = {file = "BlindButDangerousSettings.json", data = {}, extra = {}}
 do
@@ -524,6 +525,10 @@ do
 		end
 
 		track(minBtn.Activated:Connect(function() UI.sfx("click"); minimize() end))
+		track(UserInputService.InputBegan:Connect(function(input, processed)
+			if processed or input.KeyCode ~= Enum.KeyCode.RightControl then return end
+			if minimized then restore() else minimize() end
+		end))
 		onCleanup(function() if tabHolder then tabHolder:Destroy() end end)
 	end
 
@@ -1063,7 +1068,11 @@ local function pushCooldown()
 	return 10 * mult + (localPlayer:GetAttribute("Passif") == "DizzyPush" and 10 or 0)
 end
 
+-- Passives that punish the pusher (ReplicatedStorage.Passifs): Cactus = you get stuck to them, ragdolled;
+-- Juggernaut = can't be pushed, you bounce off like a wall. Auto push never targets these.
+local NO_PUSH_PASSIVES = {Cactus = true, Juggernaut = true}
 local function pushFilter(p)
+	if NO_PUSH_PASSIVES[p:GetAttribute("Passif") or ""] then return false end
 	if pushMode == 1 then return inRound(p) and isSeeker(p) end
 	if pushMode == 2 then return p == pushTarget end
 	return true
@@ -1156,8 +1165,25 @@ track(grabRangeBtn.MouseButton2Click:Connect(function()
 end))
 toggle(hiderPage, "Auto escape hostage", "autoEscape", "Spams Q + E for you when someone takes you hostage")
 
+-- Porter:FireServer() has no target: the server grabs whoever is in front of us. So if the Blind Man
+-- is anywhere close we don't grab at all, or the server could pick him instead of the hider.
+local BLIND_SAFE_GAP = 4
+local function blindManNear()
+	local myRoot = rootOf(localPlayer.Character)
+	if not myRoot then return false end
+	local ids = {ReplicatedStorage:GetAttribute("AveugleUserId") or 0, ReplicatedStorage:GetAttribute("AveugleUserId2") or 0}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer and (plr.UserId == ids[1] or plr.UserId == ids[2]) and isAlive(plr.Character) then
+			local r = rootOf(plr.Character)
+			if r and (r.Position - myRoot.Position).Magnitude < GRAB_RANGE + BLIND_SAFE_GAP then return true end
+		end
+	end
+	return false
+end
+
 track(RunService.Heartbeat:Connect(function()
 	if not state.autoGrab or not porter or grabbing then return end
+	if blindManNear() then return end
 	local char = localPlayer.Character
 	if not isAlive(char) or char:GetAttribute("TientOtage") or char:GetAttribute("Porte") then return end
 	if localPlayer:GetAttribute("QTEActif") then return end
@@ -1178,7 +1204,7 @@ track(RunService.Heartbeat:Connect(function()
 			RunService.Heartbeat:Wait()
 		end
 		local r = rootOf(t.Character)
-		if r and isAlive(t.Character) then
+		if r and isAlive(t.Character) and not blindManNear() then
 			faceTowards(r.Position)
 			pcall(function() porter:FireServer() end)
 		end
@@ -1246,26 +1272,29 @@ track(RunService.Heartbeat:Connect(function()
 	if not state.autoEscape or escapeRunning or not hostageActive() then return end
 	escapeRunning = true
 	task.spawn(function()
+		-- ControlesJoueur only sends Porter("debat") once per 0.1 s (ENVOI_DEBAT), but its bar fills on every
+		-- press. Pressing faster than that fills the bar (which then sends "liberer" and locks full) before
+		-- the server has counted enough debats, so the server refuses and the game retries every 2 s.
+		-- One press per 0.1 s = every press reaches the server.
+		local ESCAPE_PRESS_GAP = 0.105
 		local useKeys = VIM ~= nil
-		local lastLiberer = 0
+		local presses, lastLiberer = 0, 0
+		task.wait(0.1)
 		while state.autoEscape and hostageActive() do
-			if porter then
-				for _ = 1, 5 do pcall(function() porter:FireServer("debat") end) end
-				if os.clock() - lastLiberer > 0.5 then
-					lastLiberer = os.clock()
-					pcall(function() porter:FireServer("liberer") end)
-				end
-			end
+			local key = expectedKey()
 			local handlers = qteHandlers()
-			if #handlers > 0 and fakePresses(handlers, 40) then
-			elseif useKeys then
-				local key = expectedKey()
-				for _ = 1, 30 do
-					if not pcall(tapKey, key) then useKeys = false; break end
-					key = key == Enum.KeyCode.Q and Enum.KeyCode.E or Enum.KeyCode.Q
-				end
+			if #handlers > 0 and fakePresses(handlers, 1) then
+			elseif useKeys and pcall(tapKey, key) then
+			else
+				useKeys = false
+				if porter then pcall(function() porter:FireServer("debat") end) end
 			end
-			RunService.Heartbeat:Wait()
+			presses += 1
+			if porter and presses >= 30 and os.clock() - lastLiberer > 0.5 then
+				lastLiberer = os.clock()
+				pcall(function() porter:FireServer("liberer") end)
+			end
+			task.wait(ESCAPE_PRESS_GAP)
 		end
 		escapeRunning = false
 	end)
@@ -1412,6 +1441,17 @@ toggle(hiderPage, "Always sneak", "autoSneak", "Keeps sneak on so your steps don
 end)
 toggle(hiderPage, "Anti knockback", "antiKnockback", "Pushes and explosions don't move or ragdoll you", setAntiKnockback)
 
+-- Icy Floor modifier is 100% client side: ModificateursClient binds render step "ModifGlace" (Input+2) that
+-- overrides Humanoid:Move with a slow accel (16) / brake (6) velocity, plus a blue tint Lighting.ModifGlace.
+-- Unbinding it gives normal movement back. The game never rebinds it, so turning this off needs a rejoin.
+local function setNoIce(on)
+	if not on then return end
+	pcall(function() RunService:UnbindFromRenderStep("ModifGlace") end)
+	local tint = game:GetService("Lighting"):FindFirstChild("ModifGlace")
+	if tint and tint:IsA("ColorCorrectionEffect") then tint.Enabled = false end
+end
+toggle(hiderPage, "No icy floor slipping", "noIce", "Normal movement in Icy Floor rounds (turning it back off needs a rejoin)", setNoIce)
+
 track(RunService.Heartbeat:Connect(function()
 	if not state.autoPush then pushStatus.Text = "Push: off"; return end
 	if pushing then return end
@@ -1452,12 +1492,18 @@ track(RunService.Heartbeat:Connect(function()
 		local function stickTo()
 			local r, me = rootOf(s.Character), rootOf(localPlayer.Character)
 			if not (r and me) then return false end
-			local predicted = r.Position + r.AssemblyLinearVelocity * Vector3.new(0.1, 0, 0.1)
-			local away = Vector3.new(me.Position.X - predicted.X, 0, me.Position.Z - predicted.Z)
-			away = away.Magnitude > 0.1 and away.Unit or -r.CFrame.LookVector
-			local stand = Vector3.new(predicted.X, me.Position.Y, predicted.Z) + away * 2.4
-			me.CFrame = CFrame.lookAt(stand, Vector3.new(predicted.X, stand.Y, predicted.Z))
-			me.AssemblyLinearVelocity = Vector3.new(0, me.AssemblyLinearVelocity.Y, 0)
+			local hum = humOf(localPlayer.Character)
+			local st = hum and hum:GetState()
+			if st == Enum.HumanoidStateType.Physics or st == Enum.HumanoidStateType.Ragdoll
+				or st == Enum.HumanoidStateType.FallingDown or (hum and hum.PlatformStand) then
+				return false
+			end
+			-- only turn to face them, never move: teleporting next to a moving target could put us
+			-- behind / inside them, which ragdolled us and dragged us along with their character
+			local flat = Vector3.new(r.Position.X, me.Position.Y, r.Position.Z)
+			if (flat - me.Position).Magnitude > 0.2 then
+				me.CFrame = CFrame.lookAt(me.Position, flat)
+			end
 			return true
 		end
 		local t0 = os.clock()
@@ -1568,7 +1614,260 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
 	end)
 end))
 
+local Move = {speed = 24, jump = 15, hum = nil, gameSpeed = nil, appliedSpeed = nil, gameJump = nil, appliedJump = nil}
+Move.speed = tonumber(Settings.value("walkSpeed", function() return Move.speed end)) or Move.speed
+Move.jump = tonumber(Settings.value("jumpHeight", function() return Move.jump end)) or Move.jump
+function Move.jumpProp(hum) return hum.UseJumpPower and "JumpPower" or "JumpHeight" end
+function Move.jumpTarget(hum)
+	return hum.UseJumpPower and math.sqrt(2 * workspace.Gravity * Move.jump) or Move.jump
+end
+function Move.restoreSpeed()
+	local hum = Move.hum
+	if hum and hum.Parent and Move.gameSpeed then hum.WalkSpeed = Move.gameSpeed end
+	Move.gameSpeed, Move.appliedSpeed = nil, nil
+end
+function Move.restoreJump()
+	local hum = Move.hum
+	if hum and hum.Parent and Move.gameJump then hum[Move.jumpProp(hum)] = Move.gameJump end
+	Move.gameJump, Move.appliedJump = nil, nil
+end
+onCleanup(function() Move.restoreSpeed(); Move.restoreJump() end)
+
+header(miscPage, "MOVEMENT")
+toggle(miscPage, "Speed", "speedOn", "Holds your walk speed at the value below", function(on)
+	if not on then Move.restoreSpeed() end
+end)
+local speedBtn
+local function speedText() return string.format("Walk speed: %d   (click = +2, right click = -2)", Move.speed) end
+speedBtn = button(miscPage, speedText(), function()
+	Move.speed = math.clamp(Move.speed + 2, 8, 120)
+	speedBtn.Text = speedText()
+	Settings.save()
+end)
+track(speedBtn.MouseButton2Click:Connect(function()
+	Move.speed = math.clamp(Move.speed - 2, 8, 120)
+	speedBtn.Text = speedText()
+	Settings.save()
+end))
+toggle(miscPage, "Jump height", "jumpOn", "Holds your jump height at the value below", function(on)
+	if not on then Move.restoreJump() end
+end)
+local jumpBtn
+local function jumpText() return string.format("Jump height: %d studs   (click = +1, right click = -1)", Move.jump) end
+jumpBtn = button(miscPage, jumpText(), function()
+	Move.jump = math.clamp(Move.jump + 1, 2, 80)
+	jumpBtn.Text = jumpText()
+	Settings.save()
+end)
+track(jumpBtn.MouseButton2Click:Connect(function()
+	Move.jump = math.clamp(Move.jump - 1, 2, 80)
+	jumpBtn.Text = jumpText()
+	Settings.save()
+end))
+infoLabel(miscPage, "Normal: speed 16, jump ~7 studs. Big values are easy for others to notice.", 30)
+
+track(RunService.Heartbeat:Connect(function()
+	local hum = humOf(localPlayer.Character)
+	if not hum then return end
+	if hum ~= Move.hum then
+		Move.hum = hum
+		Move.gameSpeed, Move.appliedSpeed, Move.gameJump, Move.appliedJump = nil, nil, nil, nil
+	end
+	if state.speedOn and hum.WalkSpeed > 0 and hum.WalkSpeed ~= Move.speed then
+		if hum.WalkSpeed ~= Move.appliedSpeed then Move.gameSpeed = hum.WalkSpeed end
+		hum.WalkSpeed = Move.speed
+		Move.appliedSpeed = Move.speed
+	end
+	if state.jumpOn then
+		if not hum:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+			pcall(hum.SetStateEnabled, hum, Enum.HumanoidStateType.Jumping, true)
+		end
+		local prop, target = Move.jumpProp(hum), Move.jumpTarget(hum)
+		local cur = hum[prop]
+		if math.abs(cur - target) > 0.01 then
+			if not Move.appliedJump or math.abs(cur - Move.appliedJump) > 0.01 then Move.gameJump = cur end
+			hum[prop] = target
+			Move.appliedJump = target
+		end
+	end
+end))
+
 header(miscPage, "OTHER")
+
+-- Screen shake: the game's own setting (player attribute Reglage_ScreenShake = false) already turns off
+-- the gunshot / Blind-Man-nearby (ControlesJoueur "SecoussesCaches"), megaphone and shotgun recoil shakes.
+-- The hostage-struggle shake (render step "SecousseDebat") ignores that setting, so we unbind it.
+local shakeConn, shakeBefore, shakeSaved = nil, nil, false
+local function setNoShake(on)
+	if shakeConn then shakeConn:Disconnect(); shakeConn = nil end
+	if on then
+		if not shakeSaved then shakeBefore, shakeSaved = localPlayer:GetAttribute("Reglage_ScreenShake"), true end
+		pcall(function() localPlayer:SetAttribute("Reglage_ScreenShake", false) end)
+		shakeConn = localPlayer:GetAttributeChangedSignal("Reglage_ScreenShake"):Connect(function()
+			if localPlayer:GetAttribute("Reglage_ScreenShake") ~= false then
+				pcall(function() localPlayer:SetAttribute("Reglage_ScreenShake", false) end)
+			end
+		end)
+		pcall(function() RunService:UnbindFromRenderStep("SecousseDebat") end)
+	elseif shakeSaved then
+		shakeSaved = false
+		pcall(function() localPlayer:SetAttribute("Reglage_ScreenShake", shakeBefore) end)
+	end
+end
+toggle(miscPage, "No screen shake", "noShake", "Gunshots, Blind Man nearby, megaphone, shotgun recoil, hostage struggle", setNoShake)
+onCleanup(function() if state.noShake then setNoShake(false) end end)
+
+-- Stun effects (all client-side, driven by attributes the server puts on our Player):
+--   Commotion script: concussion (CommotionT -> tunnel gui "CommotionTunnel", blur "CommotionFlou", colour
+--     "CommotionCouleur", ringing "CommotionSifflement"/"CommotionSourd", muffled audio "CommotionEtouffe",
+--     camera pulled around by render steps "CommotionAvant" + "Commotion") and flashbang (FlashT -> "FlashEcran" gui).
+--   EffetPetard: firecracker nausea while EtourdiJusqua > now (camera wobble, blur, green tint, all sounds at 7%).
+--     As Blind Man that same attribute also hides your noise outlines (VisionAveugle).
+--   FauxBruits: Scary Serum fake footsteps / noises while FauxBruitsJusqua > now.
+-- Setting the "until" attributes to 0 on our side makes the game end those effects itself (sounds restored).
+local stunConns, stunDisabled = {}, {}
+local STUN_UNTIL = {"EtourdiJusqua", "FauxBruitsJusqua"}
+local function clearStunUntil(attr)
+	local v = localPlayer:GetAttribute(attr)
+	if type(v) == "number" and v > 0 then pcall(function() localPlayer:SetAttribute(attr, 0) end) end
+end
+local function killConcussion()
+	local cam = workspace.CurrentCamera
+	local flou = cam and cam:FindFirstChild("CommotionFlou")
+	local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
+	local tunnel = pg and pg:FindFirstChild("CommotionTunnel")
+	if not flou and not (tunnel and tunnel.Enabled) then return false end
+	pcall(function() RunService:UnbindFromRenderStep("CommotionAvant") end)
+	pcall(function() RunService:UnbindFromRenderStep("Commotion") end)
+	if tunnel then tunnel.Enabled = false end
+	for _, n in ipairs({"CommotionFlou", "CommotionCouleur"}) do
+		local e = cam and cam:FindFirstChild(n)
+		if e then e:Destroy() end
+	end
+	local SoundService = game:GetService("SoundService")
+	for _, d in ipairs(SoundService:GetDescendants()) do
+		if d.Name == "CommotionSifflement" or d.Name == "CommotionSourd" or d.Name == "CommotionEtouffe" then d:Destroy() end
+	end
+	return true
+end
+local stunFov = nil
+local function setNoStun(on)
+	for _, c in ipairs(stunConns) do c:Disconnect() end
+	table.clear(stunConns)
+	for _, c in ipairs(stunDisabled) do pcall(function() c:Enable() end) end
+	table.clear(stunDisabled)
+	if not on then return end
+
+	-- best way: switch off the game's CommotionT / FlashT listeners so the effects never start
+	if typeof(getconnections) == "function" then
+		for _, attr in ipairs({"CommotionT", "FlashT"}) do
+			local ok, conns = pcall(getconnections, localPlayer:GetAttributeChangedSignal(attr))
+			if ok and type(conns) == "table" then
+				for _, c in ipairs(conns) do
+					local fn = c.Function
+					local okSrc, src = pcall(debug.info, fn, "s")
+					if type(fn) == "function" and okSrc and type(src) == "string" and src:find("Commotion") then
+						if pcall(function() c:Disable() end) then table.insert(stunDisabled, c) end
+					end
+				end
+			end
+		end
+	end
+	for _, attr in ipairs(STUN_UNTIL) do
+		clearStunUntil(attr)
+		table.insert(stunConns, localPlayer:GetAttributeChangedSignal(attr):Connect(function() clearStunUntil(attr) end))
+	end
+	-- fallback (no getconnections): undo whatever started, every frame
+	table.insert(stunConns, RunService.RenderStepped:Connect(function()
+		local cam = workspace.CurrentCamera
+		local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
+		local flash = pg and pg:FindFirstChild("FlashEcran")
+		if flash and flash.Enabled then flash.Enabled = false end
+		if killConcussion() then
+			if cam and stunFov then cam.FieldOfView = stunFov end
+		elseif cam then
+			stunFov = cam.FieldOfView
+		end
+	end))
+end
+toggle(miscPage, "No stun effects", "noStun", "Concussion, flashbang white-out, firecracker nausea, Scary Serum fake noises", setNoStun)
+onCleanup(function() setNoStun(false) end)
+
+-- Shotgun recoil (ClientFusil recul): FOV +30 punch, then render step "ReculFusil<clock>" (priority Camera+1)
+-- backflips the camera over 0.32 s (pitch 200 deg + roll 180 deg) so you end up facing BEHIND you.
+-- Every shot sets the player attribute TirViewmodel, so on that we remember where the camera was looking and,
+-- from a step that runs after the game's (Camera+2), put it back for the flip window and kill the FOV punch.
+-- The knockback launch is movement, not camera, so it's left alone.
+local RECOIL_STEP = "BBD_NoShotgunFlip"
+local recoilConn, recoilUntil, recoilRot, recoilFov = nil, 0, nil, nil
+local lastCamRot, lastCamFov = nil, nil
+local FLIP_DOT = math.cos(math.rad(8))
+local function setNoRecoil(on)
+	if recoilConn then recoilConn:Disconnect(); recoilConn = nil end
+	pcall(function() RunService:UnbindFromRenderStep(RECOIL_STEP) end)
+	if not on then return end
+	recoilConn = localPlayer:GetAttributeChangedSignal("TirViewmodel"):Connect(function()
+		local cam = workspace.CurrentCamera
+		if not cam then return end
+		recoilRot = lastCamRot or cam.CFrame.Rotation
+		recoilFov = localPlayer:GetAttribute("FOVBase") or lastCamFov or cam.FieldOfView
+		recoilUntil = os.clock() + 0.45
+		-- a new tween on the same property cancels the game's +30 FOV ease-out
+		pcall(function() TweenService:Create(cam, TweenInfo.new(0), {FieldOfView = recoilFov}):Play() end)
+	end)
+	RunService:BindToRenderStep(RECOIL_STEP, Enum.RenderPriority.Camera.Value + 2, function()
+		local cam = workspace.CurrentCamera
+		if not cam then return end
+		if os.clock() < recoilUntil and recoilRot then
+			if cam.CameraType == Enum.CameraType.Custom and cam.CFrame.LookVector:Dot(recoilRot.LookVector) < FLIP_DOT then
+				cam.CFrame = CFrame.new(cam.CFrame.Position) * recoilRot
+			end
+			if recoilFov then cam.FieldOfView = recoilFov end
+		else
+			lastCamRot, lastCamFov = cam.CFrame.Rotation, cam.FieldOfView
+		end
+	end)
+end
+toggle(miscPage, "No shotgun recoil flip", "noRecoil", "Your camera stays put when you fire (no backflip, no FOV punch). Knockback still happens", setNoRecoil)
+onCleanup(function() setNoRecoil(false) end)
+
+-- Forced first person: AnimObjetsHiders locks CameraMode = LockFirstPerson while you hold a tool, and for hiders in
+-- Blackout rounds, unless the player attribute Screen3P is set (the devs' own third-person switch in DevUI, which
+-- also sets Classic + zoom >= 20). As Blind Man it's VisionAveugle instead; "Full vision" already undoes that.
+-- Holding a hostage also puts you in first person, but no client script does that, so it comes from the server
+-- (or a hidden tool). To cover every source we also undo the lock each frame, before the camera updates.
+local thirdConn
+local THIRD_STEP = "BBD_NoFirstPerson"
+local function setThirdPerson(on)
+	if thirdConn then thirdConn:Disconnect(); thirdConn = nil end
+	pcall(function() RunService:UnbindFromRenderStep(THIRD_STEP) end)
+	pcall(function() localPlayer:SetAttribute("Screen3P", on or nil) end)
+	if not on then return end
+	RunService:BindToRenderStep(THIRD_STEP, Enum.RenderPriority.Camera.Value - 1, function()
+		-- leave the Blind Man's blindfold view alone unless Full vision is on
+		if amSeeker() and not state.fullVision then return end
+		if localPlayer:GetAttribute("FOVBase") ~= nil and not state.fullVision then return end
+		if localPlayer.CameraMode == Enum.CameraMode.LockFirstPerson then localPlayer.CameraMode = Enum.CameraMode.Classic end
+		if localPlayer.CameraMaxZoomDistance < 20 then localPlayer.CameraMaxZoomDistance = 20 end
+		if localPlayer.CameraMinZoomDistance > 0.5 and localPlayer.CameraMinZoomDistance >= localPlayer.CameraMaxZoomDistance then
+			localPlayer.CameraMinZoomDistance = 0.5
+		end
+	end)
+	thirdConn = localPlayer:GetAttributeChangedSignal("Screen3P"):Connect(function()
+		if not localPlayer:GetAttribute("Screen3P") then pcall(function() localPlayer:SetAttribute("Screen3P", true) end) end
+	end)
+	task.defer(function()
+		pcall(function()
+			if localPlayer.CameraMode == Enum.CameraMode.LockFirstPerson and localPlayer:GetAttribute("FOVBase") == nil then
+				localPlayer.CameraMode = Enum.CameraMode.Classic
+			end
+			localPlayer.CameraMaxZoomDistance = math.max(localPlayer.CameraMaxZoomDistance, 20)
+		end)
+	end)
+end
+toggle(miscPage, "No forced first person", "thirdPerson", "Stay in third person when holding items and in Blackout rounds", setThirdPerson)
+onCleanup(function() if state.thirdPerson then setThirdPerson(false) end end)
+
 button(miscPage, "Daily spin", function()
 	local spin = remote("TourQuotidien")
 	if not spin then notify("Blind but Dangerous", "TourQuotidien remote not found"); return end
@@ -1576,7 +1875,7 @@ button(miscPage, "Daily spin", function()
 	pcall(function() spin:FireServer("tourner") end)
 	notify("Blind but Dangerous", "Spun the daily wheel")
 end)
-button(miscPage, "Turn everything off", function()
+local function turnAllOff()
 	local off = {}
 	for key, set in pairs(toggleSetters) do
 		if state[key] and key ~= "whistleWarn" and key ~= "dangerMeter" then
@@ -1584,8 +1883,199 @@ button(miscPage, "Turn everything off", function()
 			table.insert(off, key)
 		end
 	end
+	return off
+end
+_G.BlindButDangerousPanic = turnAllOff
+onCleanup(function() if _G.BlindButDangerousPanic == turnAllOff then _G.BlindButDangerousPanic = nil end end)
+button(miscPage, "Turn everything off", function()
+	local off = turnAllOff()
 	notify("Blind but Dangerous", #off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")
 end)
+
+-- Admin detection. Runs on its own so it still protects you when the main hub menu isn't open.
+-- If the hub is open, its own detector shows the alert and calls our panic, so this one stays quiet.
+do
+	local ROBLOX_STAFF_GROUP = 1200769
+	local STAFF_WORDS = {"admin", "mod", "staff", "owner", "founder", "developer", "dev", "creator", "manager", "helper", "head"}
+	local alerted = {}
+	local holder = make("Frame", {BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 20), Size = UDim2.new(0, 460, 1, -40), Parent = UI.toastGui,
+	}, {make("UIListLayout", {Padding = UDim.new(0, 8), HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder})})
+	local count = 0
+
+	local function reasonsFor(plr)
+		local reasons, isOwner = {}, false
+		if game.CreatorType == Enum.CreatorType.User and plr.UserId == game.CreatorId then
+			isOwner = true
+			table.insert(reasons, "Owns this game")
+		elseif game.CreatorType == Enum.CreatorType.Group then
+			local okR, rank = pcall(plr.GetRankInGroup, plr, game.CreatorId)
+			local okN, role = pcall(plr.GetRoleInGroup, plr, game.CreatorId)
+			rank = okR and rank or 0
+			role = okN and role or "?"
+			local staffWord = false
+			for _, w in ipairs(STAFF_WORDS) do
+				if role:lower():find(w, 1, true) then staffWord = true; break end
+			end
+			if rank == 255 then
+				isOwner = true
+				table.insert(reasons, "Owns this game (owner of the game's group: " .. role .. ")")
+			elseif rank >= 254 then
+				table.insert(reasons, "Top rank in the game's group: " .. role .. " (" .. rank .. ")")
+			elseif rank > 0 and staffWord then
+				table.insert(reasons, "Staff role in the game's group: " .. role .. " (" .. rank .. ")")
+			elseif rank >= 200 then
+				table.insert(reasons, "High rank in the game's group: " .. role .. " (" .. rank .. ")")
+			end
+		end
+		local okS, inStaff = pcall(plr.IsInGroup, plr, ROBLOX_STAFF_GROUP)
+		if okS and inStaff then table.insert(reasons, "Roblox staff member") end
+		return reasons, isOwner
+	end
+
+	local function showAlert(plr, reasons, isOwner, wasHere, off)
+		count += 1
+		local card = make("Frame", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 120),
+			LayoutOrder = count, Parent = holder}, {corner(12)})
+		local border = stroke(THEME.accent, 3, 0)
+		border.Parent = card
+		TweenService:Create(border, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{Transparency = 0.7}):Play()
+		local avatar = make("ImageLabel", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+			Position = UDim2.new(0, 14, 0.5, -36), Size = UDim2.fromOffset(72, 72), Parent = card}, {corner(36)})
+		task.spawn(function()
+			local ok, img = pcall(Players.GetUserThumbnailAsync, Players, plr.UserId,
+				Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+			if ok and avatar.Parent then avatar.Image = img end
+		end)
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 8), Size = UDim2.new(1, -150, 0, 26),
+			Font = Enum.Font.GothamBlack, Text = isOwner and "GAME OWNER DETECTED" or "ADMIN DETECTED", TextSize = 20,
+			TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Left, Parent = card})
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 34), Size = UDim2.new(1, -110, 0, 18),
+			Font = Enum.Font.GothamBold, Text = plr.DisplayName .. "  (@" .. plr.Name .. ")", TextSize = 15,
+			TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 54), Size = UDim2.new(1, -110, 0, 30),
+			Font = Enum.Font.GothamMedium, Text = table.concat(reasons, "\n"), TextSize = 12,
+			TextColor3 = Color3.fromRGB(255, 170, 170), TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top, Parent = card})
+		local status = make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 100, 1, -30),
+			Size = UDim2.new(1, -110, 0, 26), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.subtext,
+			TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = card,
+			Text = (wasHere and "Already in the server" or "Joined") .. " at " .. os.date("%H:%M:%S") .. "  ·  "
+				.. (#off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")})
+		local close = make("TextButton", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8), Size = UDim2.fromOffset(28, 28),
+			Font = Enum.Font.GothamBold, Text = "×", TextSize = 20, TextColor3 = THEME.text, Parent = card},
+			{corner(6), stroke(THEME.accent, 1, 0.3)})
+		track(close.Activated:Connect(function() UI.sfx("click"); card:Destroy() end))
+		track(Players.PlayerRemoving:Connect(function(p)
+			if p == plr and status.Parent then
+				status.Text = status.Text .. "  ·  left at " .. os.date("%H:%M:%S")
+				status.TextColor3 = THEME.good
+			end
+		end))
+		task.spawn(function()
+			for _ = 1, 3 do UI.sfx("error"); task.wait(0.25) end
+		end)
+	end
+
+	local function check(plr, wasHere)
+		if plr == localPlayer or alerted[plr] then return end
+		local reasons, isOwner = reasonsFor(plr)
+		if #reasons == 0 or not plr.Parent or not gui.Parent then return end
+		alerted[plr] = true
+		if type(_G.PlayerAnnoyerCleanup) == "function" then return end
+		local okOff, off = pcall(_G.BlindButDangerousPanic)
+		showAlert(plr, reasons, isOwner, wasHere, okOff and type(off) == "table" and off or {})
+	end
+
+	for _, p in ipairs(Players:GetPlayers()) do task.spawn(check, p, true) end
+	track(Players.PlayerAdded:Connect(function(p) task.spawn(check, p, false) end))
+end
+
+local tpPage = newTab("Teleport", 5, "globe")
+do
+	local function tpBehind(p)
+		local myRoot = rootOf(localPlayer.Character)
+		local r = p and p.Parent and rootOf(p.Character)
+		if not myRoot then notify("Blind but Dangerous", "You have no character right now", THEME.red); return end
+		if not r then notify("Blind but Dangerous", (p and p.DisplayName or "?") .. " has no character right now", THEME.red); return end
+		myRoot.AssemblyLinearVelocity = Vector3.zero
+		myRoot.CFrame = r.CFrame * CFrame.new(0, 0, 3)
+		notify("Blind but Dangerous", "Teleported to " .. p.DisplayName, THEME.good)
+	end
+	local function alivePlayers()
+		local list = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= localPlayer and isAlive(p.Character) and rootOf(p.Character) then table.insert(list, p) end
+		end
+		return list
+	end
+
+	header(tpPage, "QUICK")
+	local qgrid = buttonGrid(tpPage)
+	button(tpPage, "Nearest player", function()
+		local myRoot = rootOf(localPlayer.Character)
+		local best, bestDist
+		for _, p in ipairs(alivePlayers()) do
+			local d = myRoot and (rootOf(p.Character).Position - myRoot.Position).Magnitude
+			if d and (not bestDist or d < bestDist) then best, bestDist = p, d end
+		end
+		if not best then notify("Blind but Dangerous", "Nobody alive to teleport to"); return end
+		tpBehind(best)
+	end, qgrid)
+	button(tpPage, "Random player", function()
+		local list = alivePlayers()
+		if #list == 0 then notify("Blind but Dangerous", "Nobody alive to teleport to"); return end
+		tpBehind(list[math.random(#list)])
+	end, qgrid)
+	header(tpPage, "PLAYERS")
+	local grid = buttonGrid(tpPage)
+	local empty = make("TextLabel", {BackgroundTransparency = 1, Name = "000", LayoutOrder = 0, Font = Enum.Font.Gotham,
+		Text = "Nobody else in the server", TextSize = 11, TextColor3 = THEME.subtext,
+		TextXAlignment = Enum.TextXAlignment.Left, Parent = grid})
+	local headshots, items, btns, alive = {}, {}, {}, true
+	onCleanup(function() alive = false end)
+	local function label(p) return p.DisplayName .. (isAlive(p.Character) and "" or "  (dead)") end
+	local function addButton(i, p)
+		local b = button(tpPage, label(p), function() tpBehind(p) end, grid)
+		b.LayoutOrder, b.Name = i, string.format("%03d", i)
+		local pad = b:FindFirstChildOfClass("UIPadding")
+		if pad then pad.PaddingLeft = UDim.new(0, 30) end
+		b.TextXAlignment = Enum.TextXAlignment.Left
+		local img = make("ImageLabel", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, -26, 0.5, 0), Size = UDim2.fromOffset(22, 22), Image = headshots[p.UserId] or "",
+			Parent = b}, {corner(11), stroke(THEME.stroke, 1, 0)})
+		if not headshots[p.UserId] then
+			task.spawn(function()
+				local ok, url = pcall(Players.GetUserThumbnailAsync, Players, p.UserId,
+					Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+				if ok then headshots[p.UserId] = url; if img.Parent then img.Image = url end end
+			end)
+		end
+		return b
+	end
+	task.spawn(function()
+		while alive do
+			local list = {}
+			for _, p in ipairs(Players:GetPlayers()) do if p ~= localPlayer then table.insert(list, p) end end
+			table.sort(list, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+			local same = #list == #items
+			if same then for i, p in ipairs(list) do if items[i] ~= p then same = false; break end end end
+			if same then
+				for i, p in ipairs(items) do btns[i].Text = label(p) end
+			else
+				for _, b in ipairs(btns) do b:Destroy() end
+				table.clear(btns)
+				items = list
+				for i, p in ipairs(list) do btns[i] = addButton(i, p) end
+				empty.Visible = #list == 0
+			end
+			task.wait(1)
+		end
+	end)
+end
 
 _G.BlindButDangerousCleanup = function()
 	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end

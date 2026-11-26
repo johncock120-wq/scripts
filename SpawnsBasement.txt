@@ -1155,13 +1155,23 @@ tools.run("Player picker", function()
 	local pickers = {}
 
 	local function highlightRows(picker)
-		local selected = picker.textBox.Text:lower()
-		for plr, row in pairs(picker.rows) do
-			local isSel = plr.Name:lower() == selected
+		local count = #picker.selected
+		local byName = {}
+		for plr in pairs(picker.rows) do table.insert(byName, plr) end
+		table.sort(byName, function(a, b) return a.Name:lower() < b.Name:lower() end)
+		for rank, plr in ipairs(byName) do
+			local row = picker.rows[plr]
+			local index = table.find(picker.selected, plr)
+			local isSel = index ~= nil
 			row.BackgroundColor3 = isSel and THEME.panelHover or THEME.panel
 			row:FindFirstChildOfClass("UIStroke").Transparency = isSel and 0 or 1
 			tween(row.Bar, {Size = UDim2.new(0, 3, isSel and 0.6 or 0, 0)})
+			row.Order.Visible = isSel and count > 1
+			row.Order.Text = tostring(index or "")
+			row.LayoutOrder = index or (1000 + rank)
 		end
+		picker.label.Text = count > 1 and ("TARGETS  " .. count .. " selected (orbit goes through them in order)")
+			or "TARGET"
 	end
 
 	local function filterRows(picker)
@@ -1169,7 +1179,7 @@ tools.run("Player picker", function()
 		for plr, row in pairs(picker.rows) do
 			row.Visible = q == "" or plr.Name:lower():find(q, 1, true) ~= nil
 				or plr.DisplayName:lower():find(q, 1, true) ~= nil
-				or plr.Name:lower() == q
+				or table.find(picker.selected, plr) ~= nil
 		end
 		highlightRows(picker)
 	end
@@ -1199,16 +1209,24 @@ tools.run("Player picker", function()
 			TextColor3 = THEME.subtext,
 			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
 		})
+		make("TextLabel", {
+			Name = "Order", BackgroundColor3 = THEME.accent, BorderSizePixel = 0, Visible = false,
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.new(0, 20, 0, 20),
+			Font = Enum.Font.GothamBold, Text = "", TextSize = 12, TextColor3 = Color3.new(1, 1, 1), Parent = row,
+		}, {corner(10)})
 		track(row.MouseEnter:Connect(function()
-			if picker.textBox.Text:lower() ~= plr.Name:lower() then tween(row, {BackgroundColor3 = THEME.panelHover}) end
+			if not table.find(picker.selected, plr) then tween(row, {BackgroundColor3 = THEME.panelHover}) end
 		end))
 		track(row.MouseLeave:Connect(function() highlightRows(picker) end))
 		track(row.Activated:Connect(function()
-			if picker.textBox.Text:lower() == plr.Name:lower() then
-				picker.textBox.Text = ""
+			local index = table.find(picker.selected, plr)
+			if index then
+				table.remove(picker.selected, index)
 			else
-				picker.textBox.Text = plr.Name
+				table.insert(picker.selected, plr)
 			end
+			filterRows(picker)
+			picker.fireChanged()
 		end))
 		picker.rows[plr] = row
 		task.spawn(function()
@@ -1220,12 +1238,14 @@ tools.run("Player picker", function()
 	end
 
 	makePicker = function(parent, y)
-		sectionLabel("TARGET", y, parent)
+		local label = sectionLabel("TARGET", y, parent)
+		label.TextTruncate = Enum.TextTruncate.AtEnd
 		local textBox = make("TextBox", {
 			BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
 			Position = UDim2.new(0, 0, 0, y + 18), Size = UDim2.new(1, 0, 0, 30),
 			ClearTextOnFocus = false, Font = Enum.Font.Gotham, Text = "",
-			PlaceholderText = "Search players...", PlaceholderColor3 = THEME.subtext,
+			PlaceholderText = "Search, then click players (pick several to orbit them in turn)",
+			PlaceholderColor3 = THEME.subtext,
 			TextColor3 = THEME.text, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
 			Parent = parent,
 		}, {corner(8), stroke(THEME.accent, 1, 1), make("UIPadding", {PaddingLeft = UDim.new(0, 10)})})
@@ -1239,10 +1259,36 @@ tools.run("Player picker", function()
 			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
 			ScrollBarThickness = 4, ScrollBarImageColor3 = THEME.accent,
 			Parent = parent,
-		}, {corner(8), make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.Name}), pad(4)})
+		}, {corner(8), make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}), pad(4)})
 
 		registerItem("Target player", parent, textBox, y)
-		local picker = {textBox = textBox, list = list, rows = {}}
+		local picker = {textBox = textBox, list = list, rows = {}, selected = {}, label = label, changed = {}}
+
+		-- Tells running trolls (attach, mimic, stalk, spectate, echo) that the clicked selection changed.
+		function picker.fireChanged()
+			for _, fn in ipairs(picker.changed) do task.spawn(fn) end
+		end
+
+		-- Name of the main target: the first clicked player, or whatever is typed in the box.
+		function picker.getName()
+			local first = picker.selected[1]
+			if first then return first.Name end
+			return textBox.Text:match("^%s*(.-)%s*$")
+		end
+
+		-- Every clicked player still in the game, in click order (or the typed match if none clicked).
+		function picker.getPlayers()
+			local out = {}
+			for _, plr in ipairs(picker.selected) do
+				if plr.Parent then table.insert(out, plr) end
+			end
+			if #out == 0 then
+				local plr = findTarget(textBox.Text:match("^%s*(.-)%s*$"))
+				if plr then table.insert(out, plr) end
+			end
+			return out
+		end
+
 		table.insert(pickers, picker)
 		track(textBox:GetPropertyChangedSignal("Text"):Connect(function() filterRows(picker) end))
 		for _, plr in ipairs(Players:GetPlayers()) do addRow(picker, plr) end
@@ -1256,6 +1302,12 @@ tools.run("Player picker", function()
 	track(Players.PlayerRemoving:Connect(function(plr)
 		for _, picker in ipairs(pickers) do
 			if picker.rows[plr] then picker.rows[plr]:Destroy(); picker.rows[plr] = nil end
+			local index = table.find(picker.selected, plr)
+			if index then
+				table.remove(picker.selected, index)
+				highlightRows(picker)
+				picker.fireChanged()
+			end
 		end
 	end))
 	tools.done()
@@ -1532,7 +1584,7 @@ local function makeTab(name, canvasHeight, icon)
 end
 
 local generalTab = makeTab("General", 362, "settings")
-local trollTab = makeTab("Troll", 540, "skull")
+local trollTab = makeTab("Troll", 900, "skull")
 local charTab = makeTab("Character", 356, "user")
 local utilityTab = makeTab("Utility", 400, "wrench")
 local emotesTab = makeTab("Emotes", 0, "music")
@@ -1651,6 +1703,13 @@ local pulseTimer = 0
 local nextReroll = 0
 local orbitConn, buttonLocked = nil, false
 local flashToken = 0
+local orbitQueue = {}
+
+local function orbitPosition()
+	local index = targetPlayer and table.find(orbitQueue, targetPlayer)
+	if #orbitQueue > 1 and index then return "  (" .. index .. "/" .. #orbitQueue .. ")" end
+	return ""
+end
 
 local function refreshButton()
 	local keyName = CONFIG.toggleKey.Name
@@ -1660,7 +1719,7 @@ local function refreshButton()
 		buttonStroke.Color = THEME.accent
 		tween(button, {BackgroundColor3 = THEME.panelHover})
 		local name = targetPlayer and ("@" .. targetPlayer.Name) or (targetModel and targetModel.Name) or "?"
-		statusLabel.Text = "Orbiting " .. name
+		statusLabel.Text = "Orbiting " .. name .. orbitPosition()
 		statusLabel.TextColor3 = THEME.green
 	else
 		button.Text = "Start orbit   [" .. keyName .. "]"
@@ -1737,9 +1796,45 @@ local function stop()
 	refreshButton()
 end
 
+local function aliveModel(plr)
+	local model = plr and plr.Parent and plr.Character
+	if not isValidModel(model) then return nil end
+	return model:FindFirstChildOfClass("Humanoid").Health > 0 and model or nil
+end
+
+-- The next living player in the queue after the current one (wraps around).
+-- Picks up selection changes made while orbiting.
+local function nextOrbitTarget()
+	local live = annoyPicker.getPlayers()
+	if #live > 0 and #annoyPicker.selected > 0 then orbitQueue = live end
+	for i = #orbitQueue, 1, -1 do
+		if not orbitQueue[i].Parent then table.remove(orbitQueue, i) end
+	end
+	local n = #orbitQueue
+	if n == 0 then return nil end
+	local cur = table.find(orbitQueue, targetPlayer) or 0
+	for i = 1, n do
+		local plr = orbitQueue[(cur + i - 1) % n + 1]
+		if aliveModel(plr) then return plr end
+	end
+	return nil
+end
+
 local function step(dt)
 	if targetPlayer then
-		if not targetPlayer.Parent then stop(); task.spawn(flash, "Target left the game"); return end
+		if not aliveModel(targetPlayer) then
+			local nextPlr = nextOrbitTarget()
+			if nextPlr and nextPlr ~= targetPlayer then
+				targetPlayer = nextPlr
+				notify("Next target: " .. nextPlr.Name .. orbitPosition(), THEME.green)
+				refreshButton()
+			elseif not targetPlayer.Parent then
+				-- They left and nobody else is alive right now: wait on anyone still in the queue.
+				if #orbitQueue == 0 then stop(); task.spawn(flash, "Target left the game"); return end
+				targetPlayer = orbitQueue[1]
+				refreshButton()
+			end
+		end
 		targetModel = targetPlayer.Character
 	end
 	if not isValidModel(targetModel) then return end
@@ -1782,12 +1877,13 @@ local function step(dt)
 end
 
 local function start()
-	local name = textBox.Text:match("^%s*(.-)%s*$")
+	local name = annoyPicker.getName()
 	if name == "" then task.spawn(flash, "Pick a player first"); return end
-	local plr, model = findTarget(name)
-	if not plr and not model then task.spawn(flash, "No player matches \"" .. name .. "\""); return end
-	targetPlayer, targetModel = plr, model
-	if plr then textBox.Text = plr.Name end
+	orbitQueue = annoyPicker.getPlayers()
+	if #orbitQueue == 0 then task.spawn(flash, "No player matches \"" .. name .. "\""); return end
+	targetPlayer = nil
+	targetPlayer = nextOrbitTarget() or orbitQueue[1]
+	targetModel = targetPlayer.Character
 	running = true
 	reroll()
 	orbitConn = RunService.Heartbeat:Connect(step)
@@ -1914,7 +2010,7 @@ track(RunService.RenderStepped:Connect(function()
 end))
 
 local function pickedModel()
-	local name = annoyPicker.textBox.Text:match("^%s*(.-)%s*$")
+	local name = annoyPicker.getName()
 	if name == "" then notify("Pick a player first", THEME.red); return nil end
 	local plr, model = findTarget(name)
 	if not model or not isValidModel(model) then notify("Can't find \"" .. name .. "\"", THEME.red); return nil end
@@ -2222,6 +2318,467 @@ track(RunService.RenderStepped:Connect(function()
 	if cam and tHum and cam.CameraSubject ~= tHum then cam.CameraSubject = tHum end
 end))
 
+-- Headsit / Piggyback / Backpack / Face-block: one "attach" mode at a time, glued to the target every frame.
+local attach = {mode = nil, player = nil, model = nil, char = nil, noCollide = {}, track = nil, toggles = {}}
+local echoT
+tools.run("Attach trolls", function()
+	-- Roblox's own default sit animations, so they load in every game.
+	local SIT_ANIM = {[Enum.HumanoidRigType.R6] = 178130996, [Enum.HumanoidRigType.R15] = 2506281703}
+
+	-- Marketplace emotes (R15 only) used as poses. These are CATALOG ids: the real animation id
+	-- inside each emote gets looked up at runtime. Any that fail fall back to the sit pose.
+	local EMOTE_POSES = {
+		-- "Cutely sit on shoulders" (86430848623365) got people kicked for flinging: that pose shoves the
+		-- root deep inside the target's body. Chill Sit keeps the root at the hips, so it sits on top.
+		headsit = 80208324945081,    -- "Chill Sit" by renkatze
+		piggyback = 77063796314537,  -- "3.0 piggy back" by lattiese
+		backpack = 80208324945081,   -- "Chill Sit" by renkatze
+		faceblock = 112080765872940, -- "Taunt" by Epic People Gang
+	}
+	local resolved = {} -- catalog id -> animation id string, false if it failed, "pending" while loading
+	local emoteT
+
+	local function findAnimation(objects)
+		for _, obj in ipairs(objects or {}) do
+			if typeof(obj) == "Instance" then
+				local anim = obj:IsA("Animation") and obj or obj:FindFirstChildWhichIsA("Animation", true)
+				if anim and anim.AnimationId ~= "" then return anim.AnimationId end
+			end
+		end
+	end
+
+	local function resolveEmote(catalogId)
+		if not catalogId or resolved[catalogId] ~= nil then return end
+		resolved[catalogId] = "pending"
+		local animId
+		local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. catalogId) end)
+		if ok then animId = findAnimation(objs) end
+		if not animId then
+			local okI, model = pcall(function() return game:GetService("InsertService"):LoadAsset(catalogId) end)
+			if okI and model then
+				animId = findAnimation({model})
+				model:Destroy()
+			end
+		end
+		resolved[catalogId] = animId or false
+		if not animId then
+			notify("Couldn't load an emote pose, using the sit pose for it instead", THEME.subtext)
+		end
+	end
+
+	function attach.clearNoCollide()
+		for _, nc in ipairs(attach.noCollide) do pcall(function() nc:Destroy() end) end
+		table.clear(attach.noCollide)
+	end
+
+	function attach.noCollideWith(targetChar)
+		attach.clearNoCollide()
+		local char = localPlayer.Character
+		if not char or not targetChar then return end
+		for _, mine in ipairs(char:GetChildren()) do
+			if mine:IsA("BasePart") then
+				for _, theirs in ipairs(targetChar:GetChildren()) do
+					if theirs:IsA("BasePart") then
+						local nc = Instance.new("NoCollisionConstraint")
+						nc.Part0, nc.Part1, nc.Parent = mine, theirs, mine
+						table.insert(attach.noCollide, nc)
+					end
+				end
+			end
+		end
+	end
+
+	function attach.stopAnim()
+		if attach.track then pcall(function() attach.track:Stop(0.2) end) end
+		attach.track, attach.trackId, attach.trackSet = nil, nil, false
+	end
+
+	-- Which animation this mode should play right now, and whether it's an emote pose.
+	local function poseFor(mode, hum)
+		if hum.RigType == Enum.HumanoidRigType.R15 and emoteT and emoteT.get() then
+			local id = resolved[EMOTE_POSES[mode] or 0]
+			if type(id) == "string" and id ~= "pending" then return id, true end
+		end
+		if mode == "faceblock" then return nil, false end
+		return "rbxassetid://" .. (SIT_ANIM[hum.RigType] or SIT_ANIM[Enum.HumanoidRigType.R15]), false
+	end
+
+	function attach.playPose(hum, animId)
+		if attach.trackSet and attach.trackId == animId then
+			if attach.track and not attach.track.IsPlaying then pcall(function() attach.track:Play(0.2) end) end
+			return
+		end
+		attach.stopAnim()
+		attach.trackId, attach.trackSet = animId, true -- stays set even if loading fails, so we don't retry every frame
+		if not animId then return end
+		local animator = hum:FindFirstChildOfClass("Animator") or make("Animator", {Parent = hum})
+		local ok, tr = pcall(animator.LoadAnimation, animator, make("Animation", {AnimationId = animId}))
+		if not ok or not tr then return end
+		pcall(function()
+			tr.Priority = Enum.AnimationPriority.Action4
+			tr.Looped = true
+		end)
+		tr:Play(0.2)
+		attach.track = tr
+	end
+
+	attach.savedCollide = {}
+	attach.savedTouch = {}
+	function attach.restoreCollide()
+		for part, was in pairs(attach.savedCollide) do
+			if part.Parent then part.CanCollide = was end
+		end
+		table.clear(attach.savedCollide)
+		for part, was in pairs(attach.savedTouch) do
+			if part.Parent then part.CanTouch = was end
+		end
+		table.clear(attach.savedTouch)
+	end
+
+	function attach.zeroVelocity(char)
+		for _, part in ipairs(char:GetChildren()) do
+			if part:IsA("BasePart") then
+				part.AssemblyLinearVelocity = Vector3.zero
+				part.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end
+
+	function attach.release()
+		attach.mode, attach.player, attach.model, attach.char = nil, nil, nil, nil
+		attach.clearNoCollide()
+		attach.stopAnim()
+		attach.restoreCollide()
+		local _, hum, hrp = getChar()
+		if hrp then
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end
+		if hum and hum.Parent and hum.Health > 0 then
+			if not flyT.get() then hum.PlatformStand = false end
+			hum.Sit = false
+			pcall(hum.ChangeState, hum, Enum.HumanoidStateType.GettingUp)
+		end
+	end
+
+	-- How far the root sits above whatever we're sitting on, with the sit pose playing.
+	local function sitHeight(hum, hrp)
+		if hum.RigType == Enum.HumanoidRigType.R6 then return 1.5 end
+		return hrp.Size.Y / 2 + 0.5
+	end
+
+	local heightS, forwardS
+	local function goalCFrame(hum, hrp, tHum, tHRP, tHead, emote)
+		local lift = (heightS.get() - 30) * 0.1
+		local fwd = (forwardS.get() - 30) * 0.1
+		local rot = tHRP.CFrame.Rotation
+		if emote and attach.mode ~= "faceblock" then
+			-- Solo pose emotes each move the body somewhere different relative to the root, so instead
+			-- of a fixed offset, put the rider's hips (LowerTorso) on a "seat" spot on the target.
+			local seat
+			if attach.mode == "headsit" then
+				local top = tHead.Position + tHRP.CFrame.UpVector * (tHead.Size.Y / 2)
+				-- +Z is behind them: the pose's legs reach forward, so the hips sit toward the back of the head.
+				seat = CFrame.new(top) * rot * CFrame.new(0, -0.15 + lift, 1.6 - fwd)
+			elseif attach.mode == "piggyback" then
+				-- Behind their back at about waist height, facing the same way.
+				seat = tHRP.CFrame * CFrame.new(0, 0.3 + lift, 1.0 - fwd)
+			else
+				-- Backpack: sitting against their back, facing the way they came from.
+				seat = tHRP.CFrame * CFrame.new(0, 0.6 + lift, 1.0 - fwd) * CFrame.Angles(0, math.pi, 0)
+			end
+			local hips = hrp.Parent and hrp.Parent:FindFirstChild("LowerTorso")
+			if not hips then return seat end
+			-- Where the pose currently has the hips, in root space; shift the root so they land on the seat.
+			local off = hrp.CFrame:PointToObjectSpace(hips.Position)
+			return seat * CFrame.new(-off)
+		elseif attach.mode == "headsit" then
+			local top = tHead.Position + tHRP.CFrame.UpVector * (tHead.Size.Y / 2)
+			return CFrame.new(top) * rot * CFrame.new(0, sitHeight(hum, hrp) + lift, 0.2 - fwd)
+		elseif attach.mode == "piggyback" then
+			-- Behind them at waist height, facing forward, legs wrapped round their middle.
+			return tHRP.CFrame * CFrame.new(0, -tHRP.Size.Y / 2 + sitHeight(hum, hrp) + 0.3 + lift, 1.1 - fwd)
+		elseif attach.mode == "backpack" then
+			-- Back to back, a bit higher, facing the way they came from.
+			return tHRP.CFrame * CFrame.new(0, -tHRP.Size.Y / 2 + sitHeight(hum, hrp) + 0.9 + lift, 1.1 - fwd)
+				* CFrame.Angles(0, math.pi, 0)
+		else
+			-- Face-block: stand right in front of their face, looking at them.
+			local look = tHRP.CFrame.LookVector
+			local flat = Vector3.new(look.X, 0, look.Z)
+			flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+			local dy = mimic.rootHeight(hum, hrp) - mimic.rootHeight(tHum, tHRP)
+			local pos = tHRP.Position + flat * (2 + fwd) + Vector3.new(0, dy + lift, 0)
+			return CFrame.lookAt(pos, pos - flat)
+		end
+	end
+
+	function attach.step()
+		if not attach.mode or running or flinging then return end
+		if mimicT.get() or stalkT.get() then
+			for _, t in ipairs(attach.toggles) do if t.get() then t.set(false) end end
+			return
+		end
+		local plr = attach.player
+		if plr then
+			if not plr.Parent then
+				for _, t in ipairs(attach.toggles) do if t.get() then t.set(false) end end
+				notify("Target left the game", THEME.red)
+				return
+			end
+			if plr.Character and plr.Character ~= attach.model then
+				attach.model = plr.Character
+				attach.noCollideWith(attach.model)
+			end
+		end
+		local model = attach.model
+		local tHRP = model and model:FindFirstChild("HumanoidRootPart")
+		local tHead = model and model:FindFirstChild("Head")
+		local tHum = model and model:FindFirstChildOfClass("Humanoid")
+		local char, hum, hrp = getChar()
+		if not tHRP or not tHead or not tHum or tHum.Health <= 0 or not hrp or not hum or hum.Health <= 0 then return end
+
+		if attach.char ~= char then
+			attach.char = char
+			attach.stopAnim()
+			table.clear(attach.savedCollide)
+			table.clear(attach.savedTouch)
+			attach.noCollideWith(model)
+		end
+
+		local animId, emote = poseFor(attach.mode, hum)
+		-- Same recipe as Orbit (which works in R6 and R15): PlatformStand so the Humanoid stops
+		-- fighting us, and the CFrame set after physics so gravity can't pull us off between frames.
+		-- The sit pose comes from the animation track, not from Humanoid.Sit.
+		if attach.mode ~= "faceblock" and not hum.PlatformStand then hum.PlatformStand = true end
+		attach.playPose(hum, animId)
+		hrp.CFrame = goalCFrame(hum, hrp, tHum, tHRP, tHead, emote)
+		-- No spin, and only their (capped) walking speed so we glide with them smoothly:
+		-- anti-fling checks look for a fast or spinning part touching another player.
+		attach.zeroVelocity(char)
+		local v = tHRP.AssemblyLinearVelocity
+		if v.Magnitude > 40 then v = v.Unit * 40 end
+		hrp.AssemblyLinearVelocity = v
+	end
+
+	-- Our own parts can't collide while attached, or the world / their hats knock us off.
+	-- Done before physics every step because the Humanoid turns Torso/Head collision back on.
+	function attach.noclip()
+		-- Face-block stands on the ground, so it keeps normal collision (only no-collide with the target).
+		if not attach.mode or attach.mode == "faceblock" or running or flinging then return end
+		local char = localPlayer.Character
+		if not char then return end
+		for _, part in ipairs(char:GetChildren()) do
+			if part:IsA("BasePart") then
+				if part.CanCollide then
+					if attach.savedCollide[part] == nil then attach.savedCollide[part] = true end
+					part.CanCollide = false
+				end
+				-- No Touched events on them either, which is what fling detectors usually listen to.
+				if part.CanTouch then
+					if attach.savedTouch[part] == nil then attach.savedTouch[part] = true end
+					part.CanTouch = false
+				end
+			end
+		end
+		attach.zeroVelocity(char)
+	end
+
+	sectionLabel("ATTACH", 540, trollTab.page)
+	local function attachToggle(y, text, mode, verb)
+		local t
+		t = toggleRow(trollTab.page, y, text, function(on)
+			if on then
+				if running then notify("Stop orbiting first", THEME.red); return false end
+				local model, plr = pickedModel()
+				if not model then return false end
+				for _, other in ipairs(attach.toggles) do
+					if other ~= t and other.get() then other.set(false) end
+				end
+				if mimicT.get() then mimicT.set(false) end
+				if stalkT.get() then stalkT.set(false) end
+				attach.restoreCollide()
+				attach.mode, attach.player, attach.model, attach.char = mode, plr, model, nil
+				if emoteT.get() then task.spawn(resolveEmote, EMOTE_POSES[mode]) end
+			elseif attach.mode == mode then
+				attach.release()
+			end
+		end, true)
+		t.activeText = function()
+			local who = attach.player and attach.player.Name or (attach.model and attach.model.Name)
+			return who and (verb .. " " .. who) or nil
+		end
+		table.insert(attach.toggles, t)
+		return t
+	end
+	attachToggle(558, "Headsit (sit on their head)", "headsit", "Headsitting")
+	attachToggle(594, "Piggyback (ride on their back)", "piggyback", "Piggybacking")
+	attachToggle(630, "Backpack (back to back, facing behind)", "backpack", "Backpacking")
+	attachToggle(666, "Face-block (stand in their face)", "faceblock", "Face-blocking")
+	emoteT = toggleRow(trollTab.page, 702, "Emote poses (R15: chill sit, piggyback, chill sit, taunt)", function(on)
+		if on and attach.mode then task.spawn(resolveEmote, EMOTE_POSES[attach.mode]) end
+	end)
+	do
+		local wasLoading = loadingSettings
+		loadingSettings = true
+		emoteT.set(true)
+		loadingSettings = wasLoading
+	end
+	local function studs(v) return string.format("%+.1f studs", (v - 30) * 0.1) end
+	-- (Named "UP / DOWN", not "HEIGHT": the old 0-20 "RIDE HEIGHT" value in saved settings would load as -2 studs.)
+	heightS = sliderRow(trollTab.page, 738, "RIDE UP / DOWN", 0, 60, 30, nil, studs)
+	forwardS = sliderRow(trollTab.page, 772, "RIDE FORWARD / BACK", 0, 60, 30, nil, studs)
+
+	track(RunService.Stepped:Connect(attach.noclip))
+	track(RunService.Heartbeat:Connect(attach.step))
+	tools.done()
+end)
+
+-- Chat echo: repeat whatever the target says in public chat.
+tools.run("Chat echo", function()
+	local echo = {player = nil, pending = 0, nextSend = 0}
+	local TextChatService = game:GetService("TextChatService")
+	local legacyEvents = game:GetService("ReplicatedStorage"):FindFirstChild("DefaultChatSystemChatEvents")
+	local usesNewChat = false
+	pcall(function() usesNewChat = TextChatService.ChatVersion == Enum.ChatVersion.TextChatService end)
+
+	local function unescape(str)
+		str = str:gsub("<!%-%-.-%-%->", ""):gsub("</?%a[%w]*[^<>]*>", "")
+		return (str:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&amp;", "&"))
+	end
+
+	local mockT
+	local function mock(text)
+		local up = false
+		return (text:gsub("%a", function(c)
+			up = not up
+			return up and c:lower() or c:upper()
+		end))
+	end
+
+	local function send(text)
+		if usesNewChat then
+			local channels = TextChatService:FindFirstChild("TextChannels")
+			local general = channels and channels:FindFirstChild("RBXGeneral")
+			if general then general:SendAsync(text) end
+		else
+			local say = legacyEvents and legacyEvents:FindFirstChild("SayMessageRequest")
+			if say then say:FireServer(text, "All") end
+		end
+	end
+
+	local function heard(plr, text)
+		if not echoT.get() or plr ~= echo.player or type(text) ~= "string" then return end
+		text = unescape(text):match("^%s*(.-)%s*$")
+		if text == "" or text:sub(1, 1) == "/" or text:match("^[#%s]+$") then return end
+		if echo.pending >= 3 then return end -- don't build a backlog if they spam
+		if mockT.get() then text = mock(text) end
+		echo.pending += 1
+		-- Small natural delay, and at least 1.5s between our messages so chat doesn't throttle us.
+		local at = math.max(os.clock() + 0.6 + math.random() * 0.6, echo.nextSend)
+		echo.nextSend = at + 1.5
+		task.delay(at - os.clock(), function()
+			echo.pending -= 1
+			if echoT.get() and echo.player == plr and not shuttingDown then pcall(send, text) end
+		end)
+	end
+
+	echoT = toggleRow(trollTab.page, 816, "Chat echo (repeat what they say)", function(on)
+		if on then
+			local _, plr = pickedModel()
+			if not plr then return false end
+			echo.player, echo.pending = plr, 0
+		else
+			echo.player = nil
+		end
+	end, true)
+	echoT.activeText = function() return echo.player and ("Echoing " .. echo.player.Name) or nil end
+	table.insert(annoyPicker.changed, function()
+		if not echoT.get() then return end
+		local plr = findTarget(annoyPicker.getName())
+		if not plr then echoT.set(false); return end
+		if plr ~= echo.player then
+			echo.player, echo.pending = plr, 0
+			notify("Now echoing " .. plr.Name, THEME.green)
+		end
+	end)
+	mockT = toggleRow(trollTab.page, 852, "Echo in mOcKiNg case")
+
+	if usesNewChat then
+		track(TextChatService.MessageReceived:Connect(function(message)
+			local source = message.TextSource
+			local channel = message.TextChannel
+			if not source or (channel and channel.Name:find("^RBXWhisper")) then return end
+			heard(Players:GetPlayerByUserId(source.UserId), message.Text)
+		end))
+	else
+		local done = legacyEvents and legacyEvents:FindFirstChild("OnMessageDoneFiltering")
+		if done then
+			track(done.OnClientEvent:Connect(function(data)
+				if type(data) ~= "table" or data.MessageType ~= "Message" then return end
+				if data.OriginalChannel and tostring(data.OriginalChannel):find("^To ") then return end
+				heard(Players:FindFirstChild(tostring(data.FromSpeaker or "")), data.Message)
+			end))
+		else
+			local function hook(plr)
+				track(plr.Chatted:Connect(function(msg) heard(plr, msg) end))
+			end
+			for _, plr in ipairs(Players:GetPlayers()) do hook(plr) end
+			track(Players.PlayerAdded:Connect(hook))
+		end
+	end
+	track(Players.PlayerRemoving:Connect(function(plr)
+		if plr == echo.player and echoT.get() then
+			echoT.set(false)
+			notify("Echo target left the game", THEME.red)
+		end
+	end))
+	tools.done()
+end)
+
+-- When the clicked target changes, whatever troll is running follows the new pick.
+-- If nobody is picked any more, it turns off.
+tools.run("Retarget", function()
+	table.insert(annoyPicker.changed, function()
+		local plr, model = findTarget(annoyPicker.getName())
+		local valid = model and isValidModel(model)
+
+		if attach.mode then
+			if not plr then
+				for _, t in ipairs(attach.toggles) do if t.get() then t.set(false) end end
+			elseif plr ~= attach.player then
+				attach.player, attach.model, attach.char = plr, model, nil
+				if model then attach.noCollideWith(model) end
+				notify("Now on " .. plr.Name, THEME.green)
+			end
+		end
+		if mimicT.get() then
+			if not valid then mimicT.set(false)
+			elseif model ~= mimicModel then
+				mimicModel = model
+				mimic.noCollideWith(model)
+				notify("Now mimicking " .. plr.Name, THEME.green)
+			end
+		end
+		if stalkT.get() then
+			if not valid then stalkT.set(false)
+			elseif model ~= stalkModel then
+				stalkModel = model
+				notify("Now stalking " .. plr.Name, THEME.green)
+			end
+		end
+		if spectateT.get() then
+			if not valid then spectateT.set(false)
+			elseif model ~= spectateModel then
+				spectateModel = model
+				notify("Now spectating " .. plr.Name, THEME.green)
+			end
+		end
+		updateMenu()
+	end)
+	tools.done()
+end)
+
 local espEntries = {}
 local function clearEsp(plr)
 	local e = espEntries[plr]
@@ -2428,7 +2985,7 @@ tools.run("Anti-fling / anti-void", function()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 	local function movingMyself()
-		return flyT.get() or running or flinging or mimicT.get() or stalkT.get()
+		return flyT.get() or running or flinging or mimicT.get() or stalkT.get() or attach.mode ~= nil
 	end
 
 	local function rescue(why)
@@ -5610,8 +6167,15 @@ tools.run("Emotes", function()
 	track(emoteSearch.Focused:Connect(function() searchStrokeE.Color = THEME.accent end))
 	track(emoteSearch.FocusLost:Connect(function() searchStrokeE.Color = THEME.stroke end))
 
+	-- Every emote that's switched on right now, in the order they were picked.
+	-- Each entry: {btn, def, track, moving}. Walk emotes keep their entry while you stand still,
+	-- but their track is only playing while you move.
+	local playing = {}
+
 	local speedS = sliderRow(page, 58, "EMOTE SPEED", 1, 30, 10, function(v)
-		if emoteState.track then pcall(function() emoteState.track:AdjustSpeed((v / 10) * emoteState.baseSpeed) end) end
+		for _, e in ipairs(playing) do
+			pcall(function() e.track:AdjustSpeed((v / 10) * e.def.speed) end)
+		end
 	end, function(v) return string.format("%.1fx", v / 10) end)
 
 	local listFrame = make("Frame", {
@@ -5619,7 +6183,6 @@ tools.run("Emotes", function()
 		AutomaticSize = Enum.AutomaticSize.Y, Parent = page,
 	}, {make("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder})})
 
-	local currentBtn = nil
 	local function paintEmote(btn, on)
 		if not btn or not btn.Parent then return end
 		btn.TextColor3 = on and THEME.accent or THEME.text
@@ -5627,30 +6190,57 @@ tools.run("Emotes", function()
 		btn.BackgroundColor3 = on and THEME.panelHover or THEME.panel
 	end
 
-	emoteState.stop = function()
-		if emoteState.track then
-			pcall(function() emoteState.track:Stop(0.15) end)
-			emoteState.track = nil
+	local function entryFor(btn)
+		for i, e in ipairs(playing) do
+			if e.btn == btn then return e, i end
 		end
-		paintEmote(currentBtn, false)
-		currentBtn = nil
-		emoteState.name = nil
+	end
+
+	-- Keeps emoteState.name / .track in sync for the active list and the tab dot.
+	local function syncState()
+		local names = {}
+		for _, e in ipairs(playing) do table.insert(names, e.def.name) end
+		emoteState.name = #names > 0 and table.concat(names, ", ") or nil
+		emoteState.track = playing[1] and playing[1].track or nil
 		updateMenu()
 	end
 
-	buttonRow(page, 94, "Stop emote", function()
-		if emoteState.track then
+	local function removeEntry(e)
+		local _, i = entryFor(e.btn)
+		if not i then return end
+		table.remove(playing, i)
+		pcall(function() e.track:Stop(0.15) end)
+		paintEmote(e.btn, false)
+		syncState()
+	end
+
+	emoteState.stop = function()
+		local list = playing
+		playing = {}
+		for _, e in ipairs(list) do
+			pcall(function() e.track:Stop(0.15) end)
+			paintEmote(e.btn, false)
+		end
+		syncState()
+	end
+
+	buttonRow(page, 94, "Stop all emotes", function()
+		if #playing > 0 then
 			emoteState.stop()
-			notify("Emote stopped", THEME.subtext)
+			notify("Emotes stopped", THEME.subtext)
 		end
 	end, "danger")
 
+	local function isMoving(hum)
+		return hum.MoveDirection.Magnitude > 0.05 and not hum.Sit
+	end
+
 	local function playEmote(def, btn)
-		if currentBtn == btn then
-			emoteState.stop()
+		local existing = entryFor(btn)
+		if existing then
+			removeEntry(existing)
 			return
 		end
-		emoteState.stop()
 		local _, hum = getChar()
 		if not hum then notify("No character to animate", THEME.red); return end
 		local animator = hum:FindFirstChildOfClass("Animator") or make("Animator", {Parent = hum})
@@ -5661,24 +6251,41 @@ tools.run("Emotes", function()
 			return
 		end
 		trackObj.Priority = Enum.AnimationPriority.Action4
-		trackObj.Looped = def.looped
-		emoteState.baseSpeed = def.speed
-		trackObj:Play(0.1, 1, (speedS.get() / 10) * def.speed)
-		emoteState.track = trackObj
-		emoteState.name = def.name
-		currentBtn = btn
+		trackObj.Looped = def.looped or def.walk
+		local e = {btn = btn, def = def, track = trackObj, moving = false}
+		table.insert(playing, e)
+		-- Walk emotes start when you start moving (handled in the Heartbeat loop below).
+		if not def.walk or isMoving(hum) then
+			trackObj:Play(0.1, 1, (speedS.get() / 10) * def.speed)
+			e.moving = true
+		end
 		paintEmote(btn, true)
-		updateMenu()
+		syncState()
 		track(trackObj.Stopped:Connect(function()
-			if emoteState.track == trackObj then
-				emoteState.track = nil
-				paintEmote(currentBtn, false)
-				currentBtn = nil
-				emoteState.name = nil
-				updateMenu()
-			end
+			-- Walk emotes get stopped on purpose whenever you stand still; that isn't "finished".
+			if def.walk then return end
+			if entryFor(btn) == e then removeEntry(e) end
 		end))
 	end
+
+	track(RunService.Heartbeat:Connect(function()
+		if #playing == 0 then return end
+		local _, hum = getChar()
+		if not hum then return end
+		local moving = isMoving(hum)
+		for _, e in ipairs(playing) do
+			if e.def.walk and e.moving ~= moving then
+				e.moving = moving
+				pcall(function()
+					if moving then
+						e.track:Play(0.15, 1, (speedS.get() / 10) * e.def.speed)
+					else
+						e.track:Stop(0.15)
+					end
+				end)
+			end
+		end
+	end))
 
 	local sections = {}
 	local rowsByRig = {R6 = {}, R15 = {}}
@@ -5698,8 +6305,18 @@ tools.run("Emotes", function()
 		end
 	end
 
+	-- Pure walk / run cycles: these only play while you're moving (standing still in a run pose looks wrong).
+	-- Everything else, including Tank, Race Car, Helicopter, Medusa Walk and Wheel, plays the whole time,
+	-- standing or walking.
+	local WALK_ONLY = {
+		["R6 Run"] = true, ["Mini Walk"] = true, ["Tall Walk"] = true, ["Shadow Running"] = true,
+		["Adidas Running"] = true, ["Happy Run"] = true, ["Floating Run"] = true, ["Motion Run"] = true,
+		["Dino Walk"] = true, ["Climb Walk"] = true, ["Floor Crawl"] = true, ["Laggy Walk Troll"] = true,
+	}
+
 	for i, raw in ipairs(EMOTES) do
 		local def = {rig = raw[1], category = raw[2], name = raw[3], id = raw[4], speed = raw[5], looped = raw[6]}
+		def.walk = WALK_ONLY[def.name] == true
 		local sec = sections[def.rig .. def.category] or sections[def.rig .. "Other"]
 		local btn = make("TextButton", {
 			Text = def.name, LayoutOrder = i, TextTruncate = Enum.TextTruncate.AtEnd, Parent = sec.grid,
@@ -5707,7 +6324,7 @@ tools.run("Emotes", function()
 		styleButton(btn)
 		btn.TextSize = 12
 		track(btn.MouseLeave:Connect(function()
-			if btn == currentBtn then tween(btn, {BackgroundColor3 = THEME.panelHover}) end
+			if entryFor(btn) then tween(btn, {BackgroundColor3 = THEME.panelHover}) end
 		end))
 		track(btn.Activated:Connect(function() playEmote(def, btn) end))
 		table.insert(sec.rows, {btn = btn, def = def})
@@ -5868,7 +6485,7 @@ tools.run("Info tab", function()
 	end)
 
 	local function refreshPlayer()
-		local name = annoyPicker.textBox.Text:match("^%s*(.-)%s*$")
+		local name = annoyPicker.getName()
 		local plr = localPlayer
 		if name ~= "" then
 			plr = findTarget(name)
@@ -5922,7 +6539,10 @@ local function anyOn(list)
 end
 
 generalTab.isActive = anyOn({espT, fullbrightT, antiAfkT, clickTpT})
-trollTab.isActive = function() return running or spectateT.get() or mimicT.get() or stalkT.get() end
+trollTab.isActive = function()
+	return running or spectateT.get() or mimicT.get() or stalkT.get() or attach.mode ~= nil
+		or (echoT ~= nil and echoT.get())
+end
 charTab.isActive = anyOn({speedT, jumpT, infJumpT, flyT, noclipT})
 utilityTab.isActive = function() return spy ~= nil and spy.enabled end
 emotesTab.isActive = function() return emoteState.track ~= nil end
@@ -5960,7 +6580,7 @@ tools.run("Active list", function()
 		end
 		if running then
 			local name = targetPlayer and targetPlayer.Name or (targetModel and targetModel.Name) or "?"
-			table.insert(items, {key = "orbit", text = "Orbiting " .. name})
+			table.insert(items, {key = "orbit", text = "Orbiting " .. name .. orbitPosition()})
 		end
 		for _, t in ipairs(allToggles) do
 			if t.get() then
@@ -5973,6 +6593,8 @@ tools.run("Active list", function()
 					text = "Stalking " .. stalkModel.Name
 				elseif sliderFor[t] then
 					text = text .. "  " .. sliderFor[t].get()
+				elseif t.activeText then
+					text = t.activeText() or text
 				end
 				table.insert(items, {key = t.key, text = text})
 			end
@@ -6071,7 +6693,8 @@ tools.run("Admin detector", function()
 			table.insert(off, "Orbit")
 		end
 		loadingSettings = wasLoading
-		for _, panic in ipairs({{"FightClubPanic", "Fight Club "}, {"DeathCrushPanic", "DeathCrush "}}) do
+		for _, panic in ipairs({{"FightClubPanic", "Fight Club "}, {"DeathCrushPanic", "DeathCrush "},
+			{"BlindButDangerousPanic", "Blind but Dangerous "}}) do
 			if type(_G[panic[1]]) == "function" then
 				local ok, list = pcall(_G[panic[1]])
 				if ok and type(list) == "table" then
