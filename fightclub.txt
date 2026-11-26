@@ -27,7 +27,8 @@ local THEME = {
 local state = {
 	noShake = false, noRedCross = false, trainWarn = false, fightAlert = true,
 	hitLog = true, esp = false, autoBlock = false, autoPunch = false, autoKick = false, faceTarget = false,
-	guard = true, guardKick = true, paranoid = false,
+	guard = true, guardKick = true, paranoid = false, autoLeaveSafe = true,
+	speedOn = false, jumpOn = false,
 }
 
 local Settings = {file = "FightClubSettings.json", data = {}, extra = {}}
@@ -511,6 +512,10 @@ do
 		end
 
 		track(minBtn.Activated:Connect(function() UI.sfx("click"); minimize() end))
+		track(UserInputService.InputBegan:Connect(function(input, processed)
+			if processed or input.KeyCode ~= Enum.KeyCode.RightControl then return end
+			if minimized then restore() else minimize() end
+		end))
 		onCleanup(function() if tabHolder then tabHolder:Destroy() end end)
 	end
 
@@ -700,6 +705,91 @@ local function infoLabel(page, text, height)
 		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
 		LayoutOrder = #page:GetChildren(), Parent = page,
 	}, {corner(8), stroke(THEME.stroke, 1, 0), make("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)})})
+end
+
+-- One player picker style for every tab: a 2-column grid of buttons with the player's headshot.
+-- opts.onClick(plr), opts.isSelected(plr) -> bool (highlights the button),
+-- opts.nearest = {onClick = fn, isSelected = fn} adds a "Nearest player" button first.
+local playerGrid
+do
+	local headshots, grids, alive = {}, {}, true
+	onCleanup(function() alive = false end)
+	local function paint(b, sel)
+		local s = b:FindFirstChildOfClass("UIStroke")
+		if s then s.Color = sel and THEME.accent or THEME.stroke end
+		b.TextColor3 = sel and THEME.accent or THEME.text
+	end
+	local function avatarSlot(b)
+		local pad = b:FindFirstChildOfClass("UIPadding")
+		if pad then pad.PaddingLeft = UDim.new(0, 30) end
+		b.TextXAlignment = Enum.TextXAlignment.Left
+		return make("ImageLabel", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, -26, 0.5, 0), Size = UDim2.fromOffset(22, 22), Parent = b},
+			{corner(11), stroke(THEME.stroke, 1, 0)})
+	end
+	local function labelOf(p) return p.DisplayName .. (isAlive(p.Character) and "" or "  (dead)") end
+
+	local function refresh(g)
+		local list = {}
+		for _, p in ipairs(Players:GetPlayers()) do if p ~= localPlayer then table.insert(list, p) end end
+		table.sort(list, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+		local same = #list == #g.items
+		if same then for i, p in ipairs(list) do if g.items[i] ~= p then same = false; break end end end
+		if not same then
+			for _, b in ipairs(g.btns) do b:Destroy() end
+			table.clear(g.btns)
+			g.items = list
+			for i, p in ipairs(list) do
+				local b = button(g.page, labelOf(p), function()
+					g.opts.onClick(p)
+					refresh(g)
+				end, g.grid)
+				b.LayoutOrder, b.Name = i, string.format("%03d", i)
+				local img = avatarSlot(b)
+				img.Image = headshots[p.UserId] or ""
+				if not headshots[p.UserId] then
+					task.spawn(function()
+						local ok, url = pcall(Players.GetUserThumbnailAsync, Players, p.UserId,
+							Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+						if ok then headshots[p.UserId] = url; if img.Parent then img.Image = url end end
+					end)
+				end
+				g.btns[i] = b
+			end
+			g.empty.Visible = #list == 0
+		end
+		for i, p in ipairs(g.items) do
+			local b = g.btns[i]
+			b.Text = labelOf(p)
+			paint(b, g.opts.isSelected and g.opts.isSelected(p) or false)
+		end
+		if g.nearestBtn then paint(g.nearestBtn, g.opts.nearest.isSelected()) end
+	end
+
+	function playerGrid(page, opts)
+		local g = {page = page, opts = opts, grid = buttonGrid(page), items = {}, btns = {}}
+		if opts.nearest then
+			g.nearestBtn = button(page, "Nearest player", function()
+				opts.nearest.onClick()
+				refresh(g)
+			end, g.grid)
+			g.nearestBtn.LayoutOrder, g.nearestBtn.Name = 0, "000"
+			UI.icon("user", 16, avatarSlot(g.nearestBtn), THEME.text,
+				{AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+		end
+		g.empty = make("TextLabel", {BackgroundTransparency = 1, Name = "999", LayoutOrder = 999, Font = Enum.Font.Gotham,
+			Text = "Nobody else in the server", TextSize = 11, TextColor3 = THEME.subtext,
+			TextXAlignment = Enum.TextXAlignment.Left, Parent = g.grid})
+		table.insert(grids, g)
+		refresh(g)
+		return {refresh = function() refresh(g) end}
+	end
+	task.spawn(function()
+		while alive do
+			task.wait(1)
+			for _, g in ipairs(grids) do pcall(refresh, g) end
+		end
+	end)
 end
 
 local mainPage = newTab("Main", 1, "settings")
@@ -996,6 +1086,84 @@ for _, name in ipairs(emoteNames) do
 end
 button(mainPage, "Stop emote", function() emotePacket("") end)
 
+local Move = {speed = 24, jump = 15, hum = nil, gameSpeed = nil, appliedSpeed = nil, gameJump = nil, appliedJump = nil}
+Move.speed = tonumber(Settings.value("walkSpeed", function() return Move.speed end)) or Move.speed
+Move.jump = tonumber(Settings.value("jumpHeight", function() return Move.jump end)) or Move.jump
+function Move.jumpProp(hum) return hum.UseJumpPower and "JumpPower" or "JumpHeight" end
+function Move.jumpTarget(hum)
+	return hum.UseJumpPower and math.sqrt(2 * workspace.Gravity * Move.jump) or Move.jump
+end
+function Move.restoreSpeed()
+	local hum = Move.hum
+	if hum and hum.Parent and Move.gameSpeed then hum.WalkSpeed = Move.gameSpeed end
+	Move.gameSpeed, Move.appliedSpeed = nil, nil
+end
+function Move.restoreJump()
+	local hum = Move.hum
+	if hum and hum.Parent and Move.gameJump then hum[Move.jumpProp(hum)] = Move.gameJump end
+	Move.gameJump, Move.appliedJump = nil, nil
+end
+onCleanup(function() Move.restoreSpeed(); Move.restoreJump() end)
+
+header(mainPage, "MOVEMENT")
+toggle(mainPage, "Speed", "speedOn", "Holds your walk speed at the value below", function(on)
+	if not on then Move.restoreSpeed() end
+end)
+local speedBtn
+local function speedText() return string.format("Walk speed: %d   (click = +2, right click = -2)", Move.speed) end
+speedBtn = button(mainPage, speedText(), function()
+	Move.speed = math.clamp(Move.speed + 2, 8, 120)
+	speedBtn.Text = speedText()
+	Settings.save()
+end)
+track(speedBtn.MouseButton2Click:Connect(function()
+	Move.speed = math.clamp(Move.speed - 2, 8, 120)
+	speedBtn.Text = speedText()
+	Settings.save()
+end))
+toggle(mainPage, "Jump height", "jumpOn", "Holds your jump height at the value below", function(on)
+	if not on then Move.restoreJump() end
+end)
+local jumpBtn
+local function jumpText() return string.format("Jump height: %d studs   (click = +1, right click = -1)", Move.jump) end
+jumpBtn = button(mainPage, jumpText(), function()
+	Move.jump = math.clamp(Move.jump + 1, 2, 80)
+	jumpBtn.Text = jumpText()
+	Settings.save()
+end)
+track(jumpBtn.MouseButton2Click:Connect(function()
+	Move.jump = math.clamp(Move.jump - 1, 2, 80)
+	jumpBtn.Text = jumpText()
+	Settings.save()
+end))
+infoLabel(mainPage, "Normal: speed 16, jump ~7 studs. This game has an anti-cheat, big values can get you kicked.", 30)
+
+track(RunService.Heartbeat:Connect(function()
+	local hum = humOf(localPlayer.Character)
+	if not hum then return end
+	if hum ~= Move.hum then
+		Move.hum = hum
+		Move.gameSpeed, Move.appliedSpeed, Move.gameJump, Move.appliedJump = nil, nil, nil, nil
+	end
+	if state.speedOn and hum.WalkSpeed > 0 and hum.WalkSpeed ~= Move.speed then
+		if hum.WalkSpeed ~= Move.appliedSpeed then Move.gameSpeed = hum.WalkSpeed end
+		hum.WalkSpeed = Move.speed
+		Move.appliedSpeed = Move.speed
+	end
+	if state.jumpOn then
+		if not hum:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+			pcall(hum.SetStateEnabled, hum, Enum.HumanoidStateType.Jumping, true)
+		end
+		local prop, target = Move.jumpProp(hum), Move.jumpTarget(hum)
+		local cur = hum[prop]
+		if math.abs(cur - target) > 0.01 then
+			if not Move.appliedJump or math.abs(cur - Move.appliedJump) > 0.01 then Move.gameJump = cur end
+			hum[prop] = target
+			Move.appliedJump = target
+		end
+	end
+end))
+
 header(mainPage, "EFFECTS")
 toggle(mainPage, "No camera shake", "noShake", "Stops the screen shake when you get hit")
 toggle(mainPage, "No red cross", "noRedCross", "Hides the red hit cross on the crosshair")
@@ -1149,8 +1317,8 @@ else
 	serverStatus.Text = "No server list in this game"
 end
 
-infoLabel(combatPage, "These send fist packets to the server. The game runs Adonis anti-exploit, so they can get you kicked or banned. Equip Fists first.", 46)
 header(combatPage, "COMBAT")
+infoLabel(combatPage, "These send fist packets to the server. The game runs Adonis anti-exploit, so they can get you kicked or banned. Equip Fists first.", 46)
 toggle(combatPage, "Auto block", "autoBlock", "Blocks when a nearby player facing you swings or kicks")
 toggle(combatPage, "Auto punch", "autoPunch", "Punches while someone is within " .. PUNCH_RANGE .. " studs")
 toggle(combatPage, "Auto kick", "autoKick", "Alternates high / low kicks while someone is within " .. KICK_RANGE .. " studs")
@@ -1169,6 +1337,68 @@ button(combatPage, "High kick", function() fistPacket("keypress", "q") end, move
 button(combatPage, "Low kick", function() fistPacket("keypress", "e") end, moveGrid)
 local combatStatus = infoLabel(combatPage, "", 46)
 
+local function inSafeZone()
+	local folder = workspace:FindFirstChild("safezone")
+	local zone = folder and folder:FindFirstChild("Safezone")
+	local r = rootOf(localPlayer.Character)
+	if not (zone and zone:IsA("BasePart") and r) then return false, zone end
+	local p, h = zone.CFrame:PointToObjectSpace(r.Position), zone.Size / 2
+	return math.abs(p.X) <= h.X and math.abs(p.Y) <= h.Y and math.abs(p.Z) <= h.Z, zone
+end
+local leaveSafeZone
+do
+	local leaving = false
+	function leaveSafeZone()
+		local inside, zone = inSafeZone()
+		if not inside then return true end
+		while leaving do task.wait(0.1) end
+		local char = localPlayer.Character
+		local r = rootOf(char)
+		if not r or not inSafeZone() then return localPlayer:GetAttribute("canAttack") ~= false end
+		leaving = true
+		local p, h = zone.CFrame:PointToObjectSpace(r.Position), zone.Size / 2
+		local dx, dz = h.X - math.abs(p.X), h.Z - math.abs(p.Z)
+		local outLocal = dx <= dz and Vector3.new((p.X < 0 and -1 or 1) * (h.X + 5), p.Y, p.Z)
+			or Vector3.new(p.X, p.Y, (p.Z < 0 and -1 or 1) * (h.Z + 5))
+		local goal = zone.CFrame:PointToWorldSpace(outLocal)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {char, zone.Parent}
+		local hit = workspace:Raycast(goal + Vector3.new(0, 8, 0), Vector3.new(0, -60, 0), params)
+		local y = hit and hit.Position.Y + 3 or r.Position.Y
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.CFrame = CFrame.new(goal.X, y, goal.Z) * r.CFrame.Rotation
+		local t0 = os.clock()
+		task.wait(0.2)
+		while localPlayer:GetAttribute("canAttack") == false and os.clock() - t0 < 3 and char.Parent do task.wait(0.1) end
+		leaving = false
+		local ok = localPlayer:GetAttribute("canAttack") ~= false
+		log(string.format("[safezone] hopped out, canAttack=%s after %.1fs", tostring(localPlayer:GetAttribute("canAttack")),
+			os.clock() - t0), ok and THEME.good or THEME.warn)
+		return ok
+	end
+	button(combatPage, "TP out of safe zone", function()
+		if not inSafeZone() then notify("Fight Club", "You're not in the safe zone"); return end
+		local ok = leaveSafeZone()
+		notify("Fight Club", ok and "Out of the safe zone, you can hit" or "Out, but the server still says canAttack = off",
+			ok and THEME.good or THEME.red)
+	end)
+	toggle(combatPage, "Auto TP out after respawn", "autoLeaveSafe", "Hops you out of the spawn safe zone so you can hit")
+	local function onSpawn(char)
+		char:WaitForChild("HumanoidRootPart", 10)
+		task.wait(0.5)
+		if state.autoLeaveSafe and not orbiting and localPlayer.Character == char then leaveSafeZone() end
+	end
+	track(localPlayer.CharacterAdded:Connect(function(char) task.spawn(onSpawn, char) end))
+end
+local lastCanAttack = localPlayer:GetAttribute("canAttack")
+track(localPlayer:GetAttributeChangedSignal("canAttack"):Connect(function()
+	local v = localPlayer:GetAttribute("canAttack")
+	if v == lastCanAttack then return end
+	lastCanAttack = v
+	log("canAttack -> " .. tostring(v) .. (inSafeZone() and " (in safe zone)" or ""), THEME.subtext)
+end))
+
 local stopOrbit
 do
 local ORBIT = {
@@ -1181,12 +1411,23 @@ local orbit = {player = nil, angle = 0, speed = 20, dir = 1, baseHeight = 0, rad
 local function rand(a, b) return a + math.random() * (b - a) end
 
 header(combatPage, "ORBIT")
-local orbitBox = make("TextBox", {
-	BackgroundColor3 = THEME.panel, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 30), ClearTextOnFocus = false,
-	Font = Enum.Font.Gotham, Text = "", PlaceholderText = "Player name (empty = nearest)",
-	PlaceholderColor3 = THEME.subtext, TextColor3 = THEME.text, TextSize = 12,
-	TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = #combatPage:GetChildren(), Parent = combatPage,
-}, {corner(8), stroke(THEME.stroke), make("UIPadding", {PaddingLeft = UDim.new(0, 10)})})
+local orbitPick = ""
+local orbitGrid, retargetOrbit
+local function pickOrbit(name)
+	orbitPick = name
+	Settings.save()
+	if retargetOrbit then retargetOrbit() end
+end
+orbitGrid = playerGrid(combatPage, {
+	onClick = function(p)
+		pickOrbit(orbitPick:lower() == p.Name:lower() and "" or p.Name)
+	end,
+	isSelected = function(p) return orbitPick ~= "" and orbitPick:lower() == p.Name:lower() end,
+	nearest = {
+		onClick = function() pickOrbit("") end,
+		isSelected = function() return orbitPick == "" end,
+	},
+})
 
 local chaosHolder = make("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 30),
 	LayoutOrder = #combatPage:GetChildren(), Parent = combatPage})
@@ -1209,9 +1450,9 @@ local function setChaos(alpha)
 end
 local savedChaos = tonumber(Settings.value("orbitChaos", function() return orbit.chaos end))
 setChaos(((savedChaos or 1) - ORBIT.chaosMin) / (ORBIT.chaosMax - ORBIT.chaosMin))
-local savedOrbitName = Settings.value("orbitTarget", function() return orbitBox.Text end)
-if type(savedOrbitName) == "string" then orbitBox.Text = savedOrbitName end
-track(orbitBox.FocusLost:Connect(function() Settings.save() end))
+local savedOrbitName = Settings.value("orbitTarget", function() return orbitPick end)
+if type(savedOrbitName) == "string" then orbitPick = savedOrbitName:match("^%s*(.-)%s*$") end
+orbitGrid.refresh()
 local chaosSliding = false
 local function chaosSlideTo(x)
 	setChaos((x - chaosTrack.AbsolutePosition.X) / chaosTrack.AbsoluteSize.X)
@@ -1264,6 +1505,16 @@ local function findOrbitTarget(name)
 	return prefixHit
 end
 
+-- Clicking a new target while orbiting switches to them right away.
+function retargetOrbit()
+	if not orbiting then return end
+	local plr = findOrbitTarget(orbitPick)
+	if plr then
+		orbit.player = plr
+		refreshOrbit()
+	end
+end
+
 local function orbitReroll()
 	orbit.speed = rand(ORBIT.speedRange[1], ORBIT.speedRange[2]) * orbit.chaos
 	orbit.dir = math.random(0, 1) == 0 and -1 or 1
@@ -1291,6 +1542,7 @@ function stopOrbit(reason)
 end
 
 local function orbitStep(dt)
+	if orbit.hold then return end
 	local plr = orbit.player
 	if not plr or not plr.Parent then stopOrbit("Target left the game"); return end
 	local target = plr.Character
@@ -1333,16 +1585,22 @@ local function orbitStep(dt)
 end
 
 local function startOrbit()
-	local name = orbitBox.Text:match("^%s*(.-)%s*$")
+	local name = orbitPick
 	local plr = findOrbitTarget(name)
 	if not plr then
-		orbitStatus.Text = name == "" and "Nobody to orbit" or ("No player matches \"" .. name .. "\"")
+		orbitStatus.Text = name == "" and "Nobody to orbit" or ("@" .. name .. " isn't in this server - pick someone else")
 		orbitStatus.TextColor3 = THEME.accent
 		return
 	end
 	orbit.player = plr
-	orbitBox.Text = plr.Name
 	orbiting = true
+	if inSafeZone() then
+		orbit.hold = true
+		orbitStatus.Text = "Leaving safe zone first..."
+		leaveSafeZone()
+		orbit.hold = false
+		if not orbiting then return end
+	end
 	orbitReroll()
 	orbit.conn = RunService.Heartbeat:Connect(orbitStep)
 	refreshOrbit()
@@ -1358,6 +1616,16 @@ end
 
 orbitButton = button(combatPage, "", toggleOrbit)
 refreshOrbit()
+track(localPlayer.CharacterAdded:Connect(function(char)
+	if not orbiting then return end
+	orbit.hold = true
+	task.spawn(function()
+		char:WaitForChild("HumanoidRootPart", 10)
+		task.wait(0.3)
+		if orbiting and localPlayer.Character == char then leaveSafeZone() end
+		orbit.hold = false
+	end)
+end))
 track(UserInputService.InputBegan:Connect(function(input, processed)
 	if not processed and input.KeyCode == ORBIT.key then toggleOrbit() end
 end))
@@ -1399,12 +1667,12 @@ track(RunService.RenderStepped:Connect(function()
 		faceTurnedOff = false
 	end
 
-	if state.autoPunch and os.clock() - lastPunch > 0.25 and canAttack() and nearestEnemy(PUNCH_RANGE) then
+	if state.autoPunch and os.clock() - lastPunch > 0.25 and canAttack() and nearestEnemy(PUNCH_RANGE) and not inSafeZone() then
 		lastPunch = os.clock()
 		fistPacket("lmb")
 	end
 
-	if state.autoKick and os.clock() - lastKick > KICK_COOLDOWN and canAttack() and nearestEnemy(KICK_RANGE) then
+	if state.autoKick and os.clock() - lastKick > KICK_COOLDOWN and canAttack() and nearestEnemy(KICK_RANGE) and not inSafeZone() then
 		lastKick = os.clock()
 		lastPunch = os.clock()
 		fistPacket("keypress", nextKickHigh and "q" or "e")
@@ -1519,7 +1787,10 @@ track(RunService.Heartbeat:Connect(function()
 		end
 	end
 	local t, d = nearestEnemy(50)
-	combatStatus.Text = (fistsEquipped() and "Fists equipped" or "Fists NOT equipped") ..
+	local blocked = inSafeZone() and "  ·  IN SAFE ZONE, can't hit"
+		or (localPlayer:GetAttribute("canAttack") == false and "  ·  server says canAttack = off" or "")
+	combatStatus.TextColor3 = blocked ~= "" and THEME.warn or THEME.subtext
+	combatStatus.Text = (fistsEquipped() and "Fists equipped" or "Fists NOT equipped") .. blocked ..
 		(t and string.format("  ·  nearest: %s (%d studs)", t.DisplayName, d) or "  ·  nobody nearby") ..
 		string.format("\nserver answered %d of %d moves sent%s", combatStats.acked, combatStats.sent,
 			next(attackAnims) == nil and "  ·  attack anims missing, auto block off" or "")
@@ -1584,6 +1855,154 @@ do
 		local off = disableEverything()
 		notify("Fight Club", #off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")
 	end)
+end
+
+-- Admin detection. Runs on its own so it still protects you when the main hub menu isn't open.
+-- If the hub is open, its own detector shows the alert and calls our panic, so this one stays quiet.
+do
+	local ROBLOX_STAFF_GROUP = 1200769
+	local STAFF_WORDS = {"admin", "mod", "staff", "owner", "founder", "developer", "dev", "creator", "manager", "helper", "head"}
+	local alerted = {}
+	local holder = make("Frame", {BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 20), Size = UDim2.new(0, 460, 1, -40), Parent = UI.toastGui,
+	}, {make("UIListLayout", {Padding = UDim.new(0, 8), HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder})})
+	local count = 0
+
+	local function reasonsFor(plr)
+		local reasons, isOwner = {}, false
+		if game.CreatorType == Enum.CreatorType.User and plr.UserId == game.CreatorId then
+			isOwner = true
+			table.insert(reasons, "Owns this game")
+		elseif game.CreatorType == Enum.CreatorType.Group then
+			local okR, rank = pcall(plr.GetRankInGroup, plr, game.CreatorId)
+			local okN, role = pcall(plr.GetRoleInGroup, plr, game.CreatorId)
+			rank = okR and rank or 0
+			role = okN and role or "?"
+			local staffWord = false
+			for _, w in ipairs(STAFF_WORDS) do
+				if role:lower():find(w, 1, true) then staffWord = true; break end
+			end
+			if rank == 255 then
+				isOwner = true
+				table.insert(reasons, "Owns this game (owner of the game's group: " .. role .. ")")
+			elseif rank >= 254 then
+				table.insert(reasons, "Top rank in the game's group: " .. role .. " (" .. rank .. ")")
+			elseif rank > 0 and staffWord then
+				table.insert(reasons, "Staff role in the game's group: " .. role .. " (" .. rank .. ")")
+			elseif rank >= 200 then
+				table.insert(reasons, "High rank in the game's group: " .. role .. " (" .. rank .. ")")
+			end
+		end
+		local okS, inStaff = pcall(plr.IsInGroup, plr, ROBLOX_STAFF_GROUP)
+		if okS and inStaff then table.insert(reasons, "Roblox staff member") end
+		return reasons, isOwner
+	end
+
+	local function showAlert(plr, reasons, isOwner, wasHere, off)
+		count += 1
+		local card = make("Frame", {BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 120),
+			LayoutOrder = count, Parent = holder}, {corner(12)})
+		local border = stroke(THEME.accent, 3, 0)
+		border.Parent = card
+		TweenService:Create(border, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{Transparency = 0.7}):Play()
+		local avatar = make("ImageLabel", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+			Position = UDim2.new(0, 14, 0.5, -36), Size = UDim2.fromOffset(72, 72), Parent = card}, {corner(36)})
+		task.spawn(function()
+			local ok, img = pcall(Players.GetUserThumbnailAsync, Players, plr.UserId,
+				Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+			if ok and avatar.Parent then avatar.Image = img end
+		end)
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 8), Size = UDim2.new(1, -150, 0, 26),
+			Font = Enum.Font.GothamBlack, Text = isOwner and "GAME OWNER DETECTED" or "ADMIN DETECTED", TextSize = 20,
+			TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Left, Parent = card})
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 34), Size = UDim2.new(1, -110, 0, 18),
+			Font = Enum.Font.GothamBold, Text = plr.DisplayName .. "  (@" .. plr.Name .. ")", TextSize = 15,
+			TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card})
+		make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.fromOffset(100, 54), Size = UDim2.new(1, -110, 0, 30),
+			Font = Enum.Font.GothamMedium, Text = table.concat(reasons, "\n"), TextSize = 12,
+			TextColor3 = Color3.fromRGB(255, 170, 170), TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top, Parent = card})
+		local status = make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0, 100, 1, -30),
+			Size = UDim2.new(1, -110, 0, 26), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.subtext,
+			TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = card,
+			Text = (wasHere and "Already in the server" or "Joined") .. " at " .. os.date("%H:%M:%S") .. "  ·  "
+				.. (#off > 0 and ("Turned off: " .. table.concat(off, ", ")) or "Nothing was on")})
+		local close = make("TextButton", {BackgroundColor3 = THEME.panel, BorderSizePixel = 0, AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8), Size = UDim2.fromOffset(28, 28),
+			Font = Enum.Font.GothamBold, Text = "×", TextSize = 20, TextColor3 = THEME.text, Parent = card},
+			{corner(6), stroke(THEME.accent, 1, 0.3)})
+		track(close.Activated:Connect(function() UI.sfx("click"); card:Destroy() end))
+		track(Players.PlayerRemoving:Connect(function(p)
+			if p == plr and status.Parent then
+				status.Text = status.Text .. "  ·  left at " .. os.date("%H:%M:%S")
+				status.TextColor3 = THEME.good
+			end
+		end))
+		task.spawn(function()
+			for _ = 1, 3 do UI.sfx("error"); task.wait(0.25) end
+		end)
+	end
+
+	local function check(plr, wasHere)
+		if plr == localPlayer or alerted[plr] then return end
+		local reasons, isOwner = reasonsFor(plr)
+		if #reasons == 0 or not plr.Parent or not gui.Parent then return end
+		alerted[plr] = true
+		if type(_G.PlayerAnnoyerCleanup) == "function" then return end
+		local okOff, off = pcall(_G.FightClubPanic)
+		showAlert(plr, reasons, isOwner, wasHere, okOff and type(off) == "table" and off or {})
+	end
+
+	for _, p in ipairs(Players:GetPlayers()) do task.spawn(check, p, true) end
+	track(Players.PlayerAdded:Connect(function(p) task.spawn(check, p, false) end))
+end
+
+local tpPage = newTab("Teleport", 5, "user")
+do
+	local function tpBehind(p)
+		local myRoot = rootOf(localPlayer.Character)
+		local r = p and p.Parent and rootOf(p.Character)
+		if not myRoot then notify("Fight Club", "You have no character right now", THEME.red); return end
+		if not r then notify("Fight Club", (p and p.DisplayName or "?") .. " has no character right now", THEME.red); return end
+		if inSafeZone() then
+			leaveSafeZone()
+			myRoot, r = rootOf(localPlayer.Character), p.Parent and rootOf(p.Character)
+			if not (myRoot and r) then return end
+		end
+		myRoot.AssemblyLinearVelocity = Vector3.zero
+		myRoot.CFrame = r.CFrame * CFrame.new(0, 0, 3)
+		notify("Fight Club", "Teleported to " .. p.DisplayName, THEME.good)
+	end
+	local function alivePlayers()
+		local list = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= localPlayer and isAlive(p.Character) and rootOf(p.Character) then table.insert(list, p) end
+		end
+		return list
+	end
+
+	header(tpPage, "QUICK")
+	local qgrid = buttonGrid(tpPage)
+	button(tpPage, "Nearest player", function()
+		local myRoot = rootOf(localPlayer.Character)
+		local best, bestDist
+		for _, p in ipairs(alivePlayers()) do
+			local d = myRoot and (rootOf(p.Character).Position - myRoot.Position).Magnitude
+			if d and (not bestDist or d < bestDist) then best, bestDist = p, d end
+		end
+		if not best then notify("Fight Club", "Nobody alive to teleport to"); return end
+		tpBehind(best)
+	end, qgrid)
+	button(tpPage, "Random player", function()
+		local list = alivePlayers()
+		if #list == 0 then notify("Fight Club", "Nobody alive to teleport to"); return end
+		tpBehind(list[math.random(#list)])
+	end, qgrid)
+	infoLabel(tpPage, "This game has an anti-cheat, long teleports can get you flagged or kicked.", 30)
+	header(tpPage, "PLAYERS")
+	playerGrid(tpPage, {onClick = tpBehind})
 end
 
 _G.FightClubCleanup = function()
